@@ -10,6 +10,7 @@ from collections import Counter
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
+from PIL import ImageEnhance, ImageStat
 from statistics import median
 
 from PIL import Image
@@ -38,6 +39,28 @@ PERIOD_MATCH_RATIO = 0.45
 
 # 课程行内部文字允许的Y距离
 ROW_CLUSTER_MAX_DISTANCE = 45
+
+# ============================================================
+# V5.2 图像预处理
+# ============================================================
+
+# 黑边判断：边缘像素中低亮度像素占比达到此值时，认为这一行/列可能是黑边。
+BLACK_BORDER_DARK_RATIO = 0.90
+
+# “黑色”阈值，0~255。
+BLACK_BORDER_LUMINANCE = 55
+
+# 单次最多裁掉图片尺寸的比例，防止异常图片被过度裁剪。
+MAX_BORDER_CROP_RATIO = 0.35
+
+# 小图的目标最小边长。低于此值时自动放大。
+UPSCALE_TARGET_MIN_DIM = 1400
+
+# 最大放大倍数。
+UPSCALE_MAX_FACTOR = 2.0
+
+# 放大后最长边的上限，避免极大图片造成不必要的 CPU 开销。
+UPSCALE_MAX_LONG_SIDE = 3200
 
 
 # ============================================================
@@ -305,6 +328,429 @@ def parse_explicit_weekday(text):
     return english.get(
         text.lower()
     )
+
+
+# ============================================================
+# V5.2 图像预处理
+# ============================================================
+
+def _dark_ratio_in_line(gray, axis, index):
+    """
+    计算缩小灰度图某一行/列中暗像素比例。
+    axis=0：第 index 列
+    axis=1：第 index 行
+    """
+
+    width, height = gray.size
+    pixels = gray.load()
+
+    dark_count = 0
+    total = 0
+
+    if axis == 0:
+        x = index
+
+        for y in range(height):
+            total += 1
+
+            if pixels[x, y] <= BLACK_BORDER_LUMINANCE:
+                dark_count += 1
+
+    else:
+        y = index
+
+        for x in range(width):
+            total += 1
+
+            if pixels[x, y] <= BLACK_BORDER_LUMINANCE:
+                dark_count += 1
+
+    if total <= 0:
+        return 0.0
+
+    return dark_count / total
+
+
+def _find_dark_border_crop(image):
+    """
+    从四个边缘自动寻找大面积连续黑边。
+
+    特点：
+    - 只看靠近图片边缘的连续整行/整列；
+    - 不会因为课程表内部存在黑色文字或黑色表格线就整体裁剪；
+    - 单边最多裁掉 MAX_BORDER_CROP_RATIO。
+    """
+
+    width, height = image.size
+
+    # 缩小后检测，降低计算量。
+    max_probe = 900
+
+    scale = min(
+        1.0,
+        max_probe / max(width, height)
+    )
+
+    probe = image
+
+    if scale < 1.0:
+        probe = image.resize(
+            (
+                max(1, int(width * scale)),
+                max(1, int(height * scale))
+            ),
+            Image.Resampling.BILINEAR
+        )
+
+    gray = probe.convert("L")
+
+    pw, ph = gray.size
+
+    max_left = int(
+        pw * MAX_BORDER_CROP_RATIO
+    )
+
+    max_top = int(
+        ph * MAX_BORDER_CROP_RATIO
+    )
+
+    left = 0
+    right = pw - 1
+    top = 0
+    bottom = ph - 1
+
+    def is_dark_column(x):
+        return (
+            _dark_ratio_in_line(
+                gray,
+                0,
+                x
+            )
+            >= BLACK_BORDER_DARK_RATIO
+        )
+
+    def is_dark_row(y):
+        return (
+            _dark_ratio_in_line(
+                gray,
+                1,
+                y
+            )
+            >= BLACK_BORDER_DARK_RATIO
+        )
+
+    # 左边
+    while (
+        left < max_left
+        and left < right
+        and is_dark_column(left)
+    ):
+        left += 1
+
+    # 右边
+    while (
+        (pw - 1 - right) < max_left
+        and left < right
+        and is_dark_column(right)
+    ):
+        right -= 1
+
+    # 上边
+    while (
+        top < max_top
+        and top < bottom
+        and is_dark_row(top)
+    ):
+        top += 1
+
+    # 下边
+    while (
+        (ph - 1 - bottom) < max_top
+        and top < bottom
+        and is_dark_row(bottom)
+    ):
+        bottom -= 1
+
+    # 映射回原图坐标。
+    inv = 1.0 / scale
+
+    crop_left = int(round(left * inv))
+    crop_top = int(round(top * inv))
+    crop_right = int(round((right + 1) * inv))
+    crop_bottom = int(round((bottom + 1) * inv))
+
+    crop_left = max(
+        0,
+        min(
+            crop_left,
+            width - 1
+        )
+    )
+
+    crop_top = max(
+        0,
+        min(
+            crop_top,
+            height - 1
+        )
+    )
+
+    crop_right = max(
+        crop_left + 1,
+        min(
+            crop_right,
+            width
+        )
+    )
+
+    crop_bottom = max(
+        crop_top + 1,
+        min(
+            crop_bottom,
+            height
+        )
+    )
+
+    changed = (
+        crop_left > 0
+        or crop_top > 0
+        or crop_right < width
+        or crop_bottom < height
+    )
+
+    if not changed:
+        return image, {
+            "cropped": False,
+            "crop_box": [
+                0,
+                0,
+                width,
+                height
+            ]
+        }
+
+    # 给真正内容留一点边缘，避免刚好贴着裁剪线。
+    pad_x = max(
+        2,
+        int(width * 0.005)
+    )
+
+    pad_y = max(
+        2,
+        int(height * 0.005)
+    )
+
+    crop_left = max(
+        0,
+        crop_left - pad_x
+    )
+
+    crop_top = max(
+        0,
+        crop_top - pad_y
+    )
+
+    crop_right = min(
+        width,
+        crop_right + pad_x
+    )
+
+    crop_bottom = min(
+        height,
+        crop_bottom + pad_y
+    )
+
+    cropped = image.crop(
+        (
+            crop_left,
+            crop_top,
+            crop_right,
+            crop_bottom
+        )
+    )
+
+    return cropped, {
+        "cropped": True,
+        "crop_box": [
+            crop_left,
+            crop_top,
+            crop_right,
+            crop_bottom
+        ]
+    }
+
+
+def _upscale_if_needed(image):
+    """
+    小图片自动放大，正常大图不处理。
+
+    放大倍数：
+        由最小边长决定；
+        最大不超过 UPSCALE_MAX_FACTOR；
+        同时限制最长边 UPSCALE_MAX_LONG_SIDE。
+    """
+
+    width, height = image.size
+    min_dim = min(
+        width,
+        height
+    )
+
+    if min_dim >= UPSCALE_TARGET_MIN_DIM:
+        return image, {
+            "upscaled": False,
+            "scale": 1.0
+        }
+
+    factor = (
+        UPSCALE_TARGET_MIN_DIM
+        / min_dim
+    )
+
+    factor = min(
+        factor,
+        UPSCALE_MAX_FACTOR
+    )
+
+    # 限制最长边。
+    if max(width, height) * factor > UPSCALE_MAX_LONG_SIDE:
+        factor = (
+            UPSCALE_MAX_LONG_SIDE
+            /
+            max(width, height)
+        )
+
+    factor = max(
+        1.0,
+        factor
+    )
+
+    if factor <= 1.001:
+        return image, {
+            "upscaled": False,
+            "scale": 1.0
+        }
+
+    new_size = (
+        max(
+            1,
+            int(round(width * factor))
+        ),
+        max(
+            1,
+            int(round(height * factor))
+        )
+    )
+
+    return (
+        image.resize(
+            new_size,
+            Image.Resampling.LANCZOS
+        ),
+        {
+            "upscaled": True,
+            "scale": round(factor, 3)
+        }
+    )
+
+
+def _enhance_for_ocr(image, should_enhance):
+    """
+    轻度增强，不做激进二值化。
+    """
+
+    if not should_enhance:
+        return image
+
+    enhanced = ImageEnhance.Contrast(
+        image
+    ).enhance(1.08)
+
+    enhanced = ImageEnhance.Sharpness(
+        enhanced
+    ).enhance(1.15)
+
+    return enhanced
+
+
+def preprocess_input_image(input_path):
+    """
+    V5.2 主预处理：
+
+        原图
+          ↓
+        自动去黑边
+          ↓
+        小图按需放大
+          ↓
+        小图/放大图轻度增强
+          ↓
+        保存到 debug_output
+
+    只生成一个预处理版本，不额外运行第二套 OCR。
+    """
+
+    original = Image.open(
+        input_path
+    ).convert("RGB")
+
+    original_size = original.size
+
+    cropped, crop_info = (
+        _find_dark_border_crop(
+            original
+        )
+    )
+
+    resized, resize_info = (
+        _upscale_if_needed(
+            cropped
+        )
+    )
+
+    # 只在图像确实被裁剪或放大的情况下进行轻度增强。
+    processed = _enhance_for_ocr(
+        resized,
+        crop_info["cropped"]
+        or
+        resize_info["upscaled"]
+    )
+
+    os.makedirs(
+        DEBUG_OUTPUT_DIR,
+        exist_ok=True
+    )
+
+    output_path = os.path.join(
+        DEBUG_OUTPUT_DIR,
+        "_preprocessed_input.png"
+    )
+
+    processed.save(
+        output_path
+    )
+
+    return output_path, {
+        "original_size": list(
+            original_size
+        ),
+        "processed_size": list(
+            processed.size
+        ),
+        "cropped": crop_info[
+            "cropped"
+        ],
+        "crop_box": crop_info[
+            "crop_box"
+        ],
+        "upscaled": resize_info[
+            "upscaled"
+        ],
+        "scale": resize_info[
+            "scale"
+        ],
+        "output_path": output_path
+    }
 
 
 # ============================================================
@@ -3350,6 +3796,16 @@ def save_outputs(
                 3
             ),
 
+        "preprocess":
+            {
+                **preprocess_info,
+                "time_seconds":
+                    round(
+                        preprocess_time,
+                        3
+                    )
+            },
+
         "days":
             [
                 {
@@ -3569,6 +4025,70 @@ def main():
 
 
     # --------------------------------------------------------
+    # V5.2 图像预处理
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "正在预处理图片..."
+    )
+
+    preprocess_start = (
+        time.perf_counter()
+    )
+
+    preprocessed_path, preprocess_info = (
+        preprocess_input_image(
+            IMAGE_PATH
+        )
+    )
+
+    preprocess_time = (
+        time.perf_counter()
+        - preprocess_start
+    )
+
+    print(
+        f"预处理耗时："
+        f"{preprocess_time:.2f} 秒"
+    )
+
+    print(
+        f"原图尺寸："
+        f"{preprocess_info['original_size'][0]}"
+        f"x"
+        f"{preprocess_info['original_size'][1]}"
+    )
+
+    print(
+        f"处理后尺寸："
+        f"{preprocess_info['processed_size'][0]}"
+        f"x"
+        f"{preprocess_info['processed_size'][1]}"
+    )
+
+    if preprocess_info["cropped"]:
+        print(
+            f"检测到黑边并自动裁剪："
+            f"{preprocess_info['crop_box']}"
+        )
+    else:
+        print(
+            "未检测到需要裁剪的黑边"
+        )
+
+    if preprocess_info["upscaled"]:
+        print(
+            f"图片已放大："
+            f"{preprocess_info['scale']:.3f}x"
+        )
+    else:
+        print(
+            "无需放大图片"
+        )
+
+
+    # --------------------------------------------------------
     # 加载方向模型
     # --------------------------------------------------------
 
@@ -3659,7 +4179,7 @@ def main():
 
     result = (
         detect_and_select_orientation(
-            IMAGE_PATH,
+            preprocessed_path,
             orientation_model,
             ocr
         )
