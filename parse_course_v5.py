@@ -7,6 +7,9 @@ import sys
 import time
 import unicodedata
 from collections import Counter
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
 from statistics import median
 
 from PIL import Image
@@ -19,7 +22,12 @@ from paddleocr import DocImgOrientationClassification
 # ============================================================
 
 IMAGE_PATH = "test.png"
+
+# output：只放最终交付的 XLSX
 OUTPUT_DIR = "output"
+
+# debug_output：放 JSON、低置信度记录、方向矫正图片、方向候选图片等
+DEBUG_OUTPUT_DIR = "debug_output"
 
 LOW_CONFIDENCE_THRESHOLD = 0.90
 
@@ -3027,6 +3035,148 @@ def detect_and_select_orientation(
 
 
 # ============================================================
+# ============================================================
+# 清理最终输出目录
+# ============================================================
+
+def prepare_output_dir():
+    """
+    output 是最终交付目录。
+    每次运行前清理其中的旧文件，确保最终只留下 XLSX。
+    """
+
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True
+    )
+
+    for name in os.listdir(
+        OUTPUT_DIR
+    ):
+
+        path = os.path.join(
+            OUTPUT_DIR,
+            name
+        )
+
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def save_xlsx(
+    schedule,
+    day_columns,
+    xlsx_path
+):
+    """
+    将标准课程表保存为 XLSX。
+    """
+
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "课程表"
+
+    headers = (
+        ["节次"]
+        +
+        [
+            day["label"]
+            for day
+            in day_columns
+        ]
+    )
+
+    ws.append(headers)
+
+    for row in schedule:
+
+        ws.append(
+            [
+                row["period_label"]
+            ]
+            +
+            [
+                row["cells"][
+                    day["label"]
+                ]["text"]
+                for day
+                in day_columns
+            ]
+        )
+
+    # 表头与单元格采用适合人工校对的基础格式。
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center"
+        )
+
+    for row in ws.iter_rows(
+        min_row=2
+    ):
+        for cell in row:
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True
+            )
+
+    # 第一列节次稍窄，其余课程列适当加宽。
+    ws.column_dimensions["A"].width = 10
+
+    for column in range(
+        2,
+        len(headers) + 1
+    ):
+        column_letter = ws.cell(
+            row=1,
+            column=column
+        ).column_letter
+
+        ws.column_dimensions[
+            column_letter
+        ].width = 24
+
+    ws.freeze_panes = "B2"
+    ws.sheet_view.showGridLines = True
+
+    # 根据文字量设置一个适中的行高。
+    for row_index in range(
+        2,
+        ws.max_row + 1
+    ):
+        max_length = max(
+            len(str(ws.cell(
+                row=row_index,
+                column=column
+            ).value or ""))
+            for column in range(
+                1,
+                ws.max_column + 1
+            )
+        )
+
+        ws.row_dimensions[
+            row_index
+        ].height = max(
+            24,
+            min(
+                60,
+                18 + max_length * 0.8
+            )
+        )
+
+    wb.save(
+        xlsx_path
+    )
+
+
+# ============================================================
 # 保存结果
 # ============================================================
 
@@ -3057,73 +3207,36 @@ def save_outputs(
     ]
 
 
+    prepare_output_dir()
+
     os.makedirs(
-        OUTPUT_DIR,
+        DEBUG_OUTPUT_DIR,
         exist_ok=True
     )
 
 
     # --------------------------------------------------------
-    # CSV
+    # XLSX：最终交付文件，只放在 output
     # --------------------------------------------------------
 
-    csv_path = os.path.join(
+    xlsx_path = os.path.join(
         OUTPUT_DIR,
-        "course_schedule_v5.csv"
+        "course_schedule.xlsx"
+    )
+
+    save_xlsx(
+        schedule,
+        day_columns,
+        xlsx_path
     )
 
 
-    with open(
-        csv_path,
-        "w",
-        newline="",
-        encoding="utf-8-sig"
-    ) as f:
-
-        writer = csv.writer(f)
-
-        writer.writerow(
-            [
-                "节次"
-            ]
-            +
-            [
-                day["label"]
-                for day
-                in day_columns
-            ]
-        )
-
-
-        for row in schedule:
-
-            writer.writerow(
-                [
-                    row[
-                        "period_label"
-                    ]
-                ]
-                +
-                [
-                    row[
-                        "cells"
-                    ][
-                        day["label"]
-                    ][
-                        "text"
-                    ]
-                    for day
-                    in day_columns
-                ]
-            )
-
-
     # --------------------------------------------------------
-    # JSON
+    # JSON：调试/分析文件
     # --------------------------------------------------------
 
     json_path = os.path.join(
-        OUTPUT_DIR,
+        DEBUG_OUTPUT_DIR,
         "course_schedule_v5.json"
     )
 
@@ -3228,11 +3341,11 @@ def save_outputs(
 
 
     # --------------------------------------------------------
-    # 低置信度CSV
+    # 低置信度 CSV：调试/分析文件
     # --------------------------------------------------------
 
     low_path = os.path.join(
-        OUTPUT_DIR,
+        DEBUG_OUTPUT_DIR,
         "low_confidence_v5.csv"
     )
 
@@ -3265,11 +3378,11 @@ def save_outputs(
 
 
     # --------------------------------------------------------
-    # 保存最终正向图片
+    # 最终正向图片：调试文件
     # --------------------------------------------------------
 
     final_image_path = os.path.join(
-        OUTPUT_DIR,
+        DEBUG_OUTPUT_DIR,
         "oriented_final.png"
     )
 
@@ -3282,8 +3395,8 @@ def save_outputs(
 
 
     return {
-        "csv":
-            csv_path,
+        "xlsx":
+            xlsx_path,
 
         "json":
             json_path,
@@ -3296,7 +3409,6 @@ def save_outputs(
     }
 
 
-# ============================================================
 # 主程序
 # ============================================================
 
