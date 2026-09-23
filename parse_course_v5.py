@@ -2861,7 +2861,7 @@ def detect_and_select_orientation(
 
 
         candidate_path = os.path.join(
-            OUTPUT_DIR,
+            DEBUG_OUTPUT_DIR,
             f"_orientation_{angle}.png"
         )
 
@@ -3034,7 +3034,6 @@ def detect_and_select_orientation(
     }
 
 
-# ============================================================
 # ============================================================
 # 清理最终输出目录
 # ============================================================
@@ -3435,8 +3434,12 @@ def main():
         sys.exit(1)
 
 
+    # output 只作为最终交付目录。
+    # 运行开始时先清空旧文件，避免解析失败时留下上一张课表的旧 XLSX。
+    prepare_output_dir()
+
     os.makedirs(
-        OUTPUT_DIR,
+        DEBUG_OUTPUT_DIR,
         exist_ok=True
     )
 
@@ -3723,12 +3726,12 @@ def main():
 
     print()
     print(
-        f"CSV："
-        f"{outputs['csv']}"
+        f"XLSX："
+        f"{outputs['xlsx']}"
     )
 
     print(
-        f"JSON："
+        f"调试JSON："
         f"{outputs['json']}"
     )
 
