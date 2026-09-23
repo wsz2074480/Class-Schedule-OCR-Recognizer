@@ -1458,15 +1458,347 @@ def assign_days(
 
 
 # ============================================================
+# 教师姓名过滤
+# ============================================================
+
+# 常见中文姓氏。
+# 这里不建立固定“教师名单”，只用于判断一个短文本是否“像人名”。
+COMMON_SURNAMES = set(
+    "赵钱孙李周吴郑王"
+    "冯陈褚卫蒋沈韩杨"
+    "朱秦尤许何吕施张"
+    "孔曹严华金魏陶姜"
+    "戚谢邹喻柏水窦章"
+    "云苏潘葛奚范彭郎"
+    "鲁韦昌马苗凤花方"
+    "俞任袁柳酆鲍史唐"
+    "费廉岑薛雷贺倪汤"
+    "滕殷罗毕郝邬安常"
+    "乐于时傅皮卞齐康"
+    "伍余元卜顾孟平黄"
+    "和穆萧尹姚邵湛汪"
+    "祁毛禹狄米贝明臧"
+    "计伏成戴谈宋茅庞"
+    "熊纪舒屈项祝董梁"
+    "杜阮蓝闵席季麻强"
+    "贾路娄危江童颜郭"
+    "梅盛林刁钟徐邱骆"
+    "高夏蔡田樊胡凌霍"
+    "虞万支柯昝管卢莫"
+    "经房裘缪干解应宗"
+    "丁宣贲邓郁单杭洪"
+    "包诸左石崔吉钮龚"
+    "程嵇邢滑裴陆荣翁"
+    "荀羊於惠甄曲家封"
+    "芮羿储靳汲邴糜松"
+    "井段富巫乌焦巴弓"
+    "牧隗山谷车侯宓蓬"
+    "全郗班仰秋仲伊宫"
+    "宁仇栾暴甘钭厉戎"
+    "祖武符刘景詹束龙"
+    "叶幸司韶郜黎蓟薄"
+    "印宿白怀蒲邰从鄂"
+    "索咸籍赖卓蔺屠蒙"
+    "池乔阴郁胥能苍双"
+    "闻莘党翟谭贡劳逄"
+    "姬申扶堵冉宰郦雍"
+    "郤璩桑桂濮牛寿通"
+    "边扈燕冀郏浦尚农"
+    "温别庄晏柴瞿阎充"
+    "慕连茹习宦艾鱼容"
+    "向古易慎戈廖庾终"
+    "暨居衡步都耿满弘"
+    "匡国文寇广禄阙东"
+    "欧殳沃利蔚越夔隆"
+    "师巩厍聂晁勾敖融"
+    "冷訾辛阚那简饶空"
+    "曾毋沙乜养鞠须丰"
+    "巢关蒯相查后荆红"
+    "游竺权逯盖益桓公"
+)
+
+# 明确是课程/课程组成部分的短文本。
+COURSE_NAME_EXACT = {
+    "语文", "数学", "英语", "外语", "科学", "体育", "音乐",
+    "美术", "艺术", "书法", "劳动", "信息科技", "信息技术",
+    "道德与法治", "品德与社会", "综合实践", "综合实践活动",
+    "心理健康", "校本课程", "校本课", "班队会", "班队课",
+    "班会", "体育与健康", "唱游", "造型", "阅读", "写字",
+    "地方课程", "传统文化", "国学", "计算机", "技术",
+}
+
+
+def is_name_like(text):
+    """
+    判断一个完整 OCR 文本是否像中文姓名。
+    """
+
+    text = normalize_text(text)
+    text = re.sub(r"\s+", "", text)
+
+    if text in COURSE_NAME_EXACT:
+        return False
+
+    if not re.fullmatch(
+        r"[\u4e00-\u9fff]{2,3}",
+        text
+    ):
+        return False
+
+    if text[0] not in COMMON_SURNAMES:
+        return False
+
+    return True
+
+
+def extract_edge_name_candidates(text):
+    """
+    从 OCR 文本首尾寻找教师姓名候选。
+
+    重点处理：
+        语文陈雅萍
+        陈雅萍语文
+        综合实践活动谭明霞
+        校本课(体育与健康)艾淑玮
+        姜家欢唱游·乐潘姝玥
+    """
+
+    text = normalize_text(text)
+    compact = re.sub(r"\s+", "", text)
+
+    if not compact:
+        return []
+
+    candidates = []
+
+    # “陈雅萍老师”
+    match = re.search(
+        r"([\u4e00-\u9fff]{2,3})老师$",
+        compact
+    )
+
+    if match:
+        name = match.group(1)
+
+        if is_name_like(name):
+            candidates.append(
+                (name, "suffix")
+            )
+
+    # 末尾人名：课程 + 教师
+    for length in (3, 2):
+
+        if len(compact) < length:
+            continue
+
+        candidate = compact[-length:]
+
+        if is_name_like(candidate):
+            candidates.append(
+                (candidate, "suffix")
+            )
+
+    # 开头人名：教师 + 课程
+    for length in (3, 2):
+
+        if len(compact) < length:
+            continue
+
+        candidate = compact[:length]
+
+        if is_name_like(candidate):
+            candidates.append(
+                (candidate, "prefix")
+            )
+
+    result = []
+    seen = set()
+
+    for name, position in candidates:
+
+        key = (
+            name,
+            position
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        result.append(
+            (name, position)
+        )
+
+    return result
+
+
+def infer_teacher_names(items):
+    """
+    从整张课表的有效 OCR 项目中推断教师姓名。
+
+    规则：
+    1. 单独 OCR 出来的 2~3 字姓名，直接纳入。
+    2. 文本末尾的姓名，按“课程 + 教师”处理。
+    3. 文本开头的姓名需要重复出现或同时具备首尾姓名证据，
+       避免误删课程名称。
+    """
+
+    exact_counts = Counter()
+    suffix_counts = Counter()
+    prefix_counts = Counter()
+    edge_positions = {}
+
+    for item in items:
+
+        text = normalize_text(
+            item.get(
+                "text",
+                ""
+            )
+        )
+
+        compact = re.sub(
+            r"\s+",
+            "",
+            text
+        )
+
+        if not compact:
+            continue
+
+        if is_name_like(compact):
+            exact_counts[compact] += 1
+
+        candidates = extract_edge_name_candidates(
+            compact
+        )
+
+        names_in_item = set()
+
+        for name, position in candidates:
+
+            names_in_item.add(name)
+
+            edge_positions.setdefault(
+                name,
+                []
+            ).append(position)
+
+            if position == "suffix":
+                suffix_counts[name] += 1
+
+            elif position == "prefix":
+                prefix_counts[name] += 1
+
+        # 一个 OCR 框里同时出现两个姓名，
+        # 例如：姜家欢唱游·乐潘姝玥
+        # 可增强前缀人名的可信度。
+        if len(names_in_item) >= 2:
+
+            for name in names_in_item:
+
+                edge_positions.setdefault(
+                    name,
+                    []
+                ).append(
+                    "multi_name"
+                )
+
+    teacher_names = set()
+
+    # 单独识别出的姓名。
+    for name in exact_counts:
+        teacher_names.add(name)
+
+    # 课程 + 教师：末尾姓名是最典型情况。
+    for name in suffix_counts:
+        teacher_names.add(name)
+
+    # 教师 + 课程：需要更多证据。
+    for name, count in prefix_counts.items():
+
+        positions = edge_positions.get(
+            name,
+            []
+        )
+
+        if (
+            exact_counts.get(name, 0) > 0
+            or
+            count >= 2
+            or
+            "multi_name" in positions
+        ):
+            teacher_names.add(name)
+
+    return teacher_names
+
+
+def remove_teacher_names(
+    text,
+    teacher_names
+):
+    """
+    从课程文本中删除教师姓名。
+    """
+
+    text = normalize_text(text)
+
+    text = re.sub(
+        r"\s+",
+        "",
+        text
+    )
+
+    if not text or not teacher_names:
+        return text
+
+    # 长姓名优先。
+    for name in sorted(
+        teacher_names,
+        key=len,
+        reverse=True
+    ):
+
+        if not name:
+            continue
+
+        text = text.replace(
+            name,
+            ""
+        )
+
+    # 清理尾部“老师 / 教师”标记。
+    text = re.sub(
+        r"(?:教师|老师)[:：]?$",
+        "",
+        text
+    )
+
+    return normalize_text(text).strip()
+
+
+# ============================================================
 # 单元格文字合并
 # ============================================================
 
 def join_cell_items(
-    items
+    items,
+    teacher_names=None
 ):
+    """
+    合并课程格中的 OCR 项目，同时删除教师姓名。
+    """
 
     if not items:
         return ""
+
+    teacher_names = (
+        teacher_names
+        if teacher_names is not None
+        else set()
+    )
 
     items = sorted(
         items,
@@ -1477,9 +1809,9 @@ def join_cell_items(
     )
 
     parts = []
-
     seen = set()
 
+    # 第一层：逐 OCR 框清洗
     for item in items:
 
         text = normalize_text(
@@ -1489,26 +1821,37 @@ def join_cell_items(
         if not text:
             continue
 
+        # OCR 单独识别出一整行教师姓名。
+        if (
+            text in teacher_names
+            and
+            is_name_like(text)
+        ):
+            continue
+
+        # OCR 把课程和教师粘成一个框。
+        text = remove_teacher_names(
+            text,
+            teacher_names
+        )
+
+        if not text:
+            continue
+
         if text in seen:
             continue
 
         seen.add(text)
+        parts.append(text)
 
-        parts.append(
-            text
-        )
-
-
+    # 第二层：合并剩余课程文字
     result = ""
 
     for text in parts:
 
         if not result:
-
             result = text
-
             continue
-
 
         if (
             re.search(
@@ -1522,18 +1865,18 @@ def join_cell_items(
             )
         ):
 
-            result += (
-                " "
-                + text
-            )
+            result += " " + text
 
         else:
 
             result += text
 
+    return result.strip()
 
-    return result
 
+# ============================================================
+# 方向模型结果解析
+# ============================================================
 
 # ============================================================
 # 方向模型结果解析
@@ -2002,6 +2345,17 @@ def parse_orientation(
 
 
     # --------------------------------------------------------
+    # 推断教师姓名
+    # --------------------------------------------------------
+    #
+    # 只使用已经位于课程网格内的有效 OCR 项目。
+    # 网格外的“上午 / 下午”等文字不会进入教师候选。
+    #
+    teacher_names = infer_teacher_names(
+        valid_items
+    )
+
+    # --------------------------------------------------------
     # 建立课程表
     # --------------------------------------------------------
 
@@ -2131,7 +2485,8 @@ def parse_orientation(
 
 
             text = join_cell_items(
-                cell_items
+                cell_items,
+                teacher_names
             )
 
 
@@ -2378,6 +2733,11 @@ def parse_orientation(
 
         "valid_item_count":
             len(valid_items),
+
+        "teacher_names":
+            sorted(
+                teacher_names
+            ),
 
         "non_empty_cells":
             non_empty,
@@ -2837,6 +3197,12 @@ def save_outputs(
 
         "low_confidence":
             low_confidence,
+
+        "filtered_teacher_names":
+            parsed.get(
+                "teacher_names",
+                []
+            ),
 
 
         "ignored_items":
