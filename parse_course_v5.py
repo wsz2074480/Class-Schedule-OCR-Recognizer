@@ -6,6 +6,7 @@ import re
 import sys
 import time
 import unicodedata
+from collections import Counter
 from statistics import median
 
 from PIL import Image
