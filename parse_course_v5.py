@@ -14,7 +14,7 @@ from statistics import median
 
 import numpy as np
 
-from PIL import Image
+from PIL import Image, ImageEnhance
 from paddleocr import PaddleOCR
 from paddleocr import DocImgOrientationClassification
 
