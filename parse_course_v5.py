@@ -10,8 +10,9 @@ from collections import Counter
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
-from PIL import ImageEnhance, ImageStat
 from statistics import median
+
+import numpy as np
 
 from PIL import Image
 from paddleocr import PaddleOCR
@@ -334,46 +335,12 @@ def parse_explicit_weekday(text):
 # V5.2 图像预处理
 # ============================================================
 
-def _dark_ratio_in_line(gray, axis, index):
-    """
-    计算缩小灰度图某一行/列中暗像素比例。
-    axis=0：第 index 列
-    axis=1：第 index 行
-    """
-
-    width, height = gray.size
-    pixels = gray.load()
-
-    dark_count = 0
-    total = 0
-
-    if axis == 0:
-        x = index
-
-        for y in range(height):
-            total += 1
-
-            if pixels[x, y] <= BLACK_BORDER_LUMINANCE:
-                dark_count += 1
-
-    else:
-        y = index
-
-        for x in range(width):
-            total += 1
-
-            if pixels[x, y] <= BLACK_BORDER_LUMINANCE:
-                dark_count += 1
-
-    if total <= 0:
-        return 0.0
-
-    return dark_count / total
-
-
 def _find_dark_border_crop(image):
     """
     从四个边缘自动寻找大面积连续黑边。
+
+    使用缩小后的 NumPy 灰度矩阵一次计算行/列暗像素比例，
+    避免 Python 逐像素循环影响处理速度。
 
     特点：
     - 只看靠近图片边缘的连续整行/整列；
@@ -391,9 +358,8 @@ def _find_dark_border_crop(image):
         max_probe / max(width, height)
     )
 
-    probe = image
-
     if scale < 1.0:
+
         probe = image.resize(
             (
                 max(1, int(width * scale)),
@@ -402,9 +368,31 @@ def _find_dark_border_crop(image):
             Image.Resampling.BILINEAR
         )
 
-    gray = probe.convert("L")
+    else:
 
-    pw, ph = gray.size
+        probe = image
+
+    gray_array = np.asarray(
+        probe.convert("L"),
+        dtype=np.uint8
+    )
+
+    dark_mask = (
+        gray_array
+        <= BLACK_BORDER_LUMINANCE
+    )
+
+    # 每一列 / 每一行中暗像素的比例。
+    column_dark_ratio = (
+        dark_mask.mean(axis=0)
+    )
+
+    row_dark_ratio = (
+        dark_mask.mean(axis=1)
+    )
+
+    pw = gray_array.shape[1]
+    ph = gray_array.shape[0]
 
     max_left = int(
         pw * MAX_BORDER_CROP_RATIO
@@ -414,70 +402,92 @@ def _find_dark_border_crop(image):
         ph * MAX_BORDER_CROP_RATIO
     )
 
-    left = 0
-    right = pw - 1
-    top = 0
-    bottom = ph - 1
+    def find_left_run(ratios, max_count):
+        count = 0
 
-    def is_dark_column(x):
-        return (
-            _dark_ratio_in_line(
-                gray,
-                0,
-                x
-            )
-            >= BLACK_BORDER_DARK_RATIO
+        limit = min(
+            len(ratios),
+            max_count
         )
 
-    def is_dark_row(y):
-        return (
-            _dark_ratio_in_line(
-                gray,
-                1,
-                y
-            )
+        while (
+            count < limit
+            and
+            ratios[count]
             >= BLACK_BORDER_DARK_RATIO
+        ):
+            count += 1
+
+        return count
+
+    def find_right_run(ratios, max_count):
+        count = 0
+
+        limit = min(
+            len(ratios),
+            max_count
         )
 
-    # 左边
-    while (
-        left < max_left
-        and left < right
-        and is_dark_column(left)
-    ):
-        left += 1
+        while (
+            count < limit
+            and
+            ratios[
+                len(ratios) - 1 - count
+            ]
+            >= BLACK_BORDER_DARK_RATIO
+        ):
+            count += 1
 
-    # 右边
-    while (
-        (pw - 1 - right) < max_left
-        and left < right
-        and is_dark_column(right)
-    ):
-        right -= 1
+        return count
 
-    # 上边
-    while (
-        top < max_top
-        and top < bottom
-        and is_dark_row(top)
-    ):
-        top += 1
+    left = find_left_run(
+        column_dark_ratio,
+        max_left
+    )
 
-    # 下边
-    while (
-        (ph - 1 - bottom) < max_top
-        and top < bottom
-        and is_dark_row(bottom)
-    ):
-        bottom -= 1
+    right = find_right_run(
+        column_dark_ratio,
+        max_left
+    )
 
-    # 映射回原图坐标。
+    top = find_left_run(
+        row_dark_ratio,
+        max_top
+    )
+
+    bottom = find_right_run(
+        row_dark_ratio,
+        max_top
+    )
+
+    # 防止四边连续黑色时把整个图片裁空。
+    if (
+        left + right >= pw
+        or
+        top + bottom >= ph
+    ):
+        left = 0
+        right = 0
+        top = 0
+        bottom = 0
+
     inv = 1.0 / scale
 
-    crop_left = int(round(left * inv))
-    crop_top = int(round(top * inv))
-    crop_right = int(round((right + 1) * inv))
-    crop_bottom = int(round((bottom + 1) * inv))
+    crop_left = int(
+        round(left * inv)
+    )
+
+    crop_top = int(
+        round(top * inv)
+    )
+
+    crop_right = int(
+        round((pw - right) * inv)
+    )
+
+    crop_bottom = int(
+        round((ph - bottom) * inv)
+    )
 
     crop_left = max(
         0,
@@ -513,12 +523,16 @@ def _find_dark_border_crop(image):
 
     changed = (
         crop_left > 0
-        or crop_top > 0
-        or crop_right < width
-        or crop_bottom < height
+        or
+        crop_top > 0
+        or
+        crop_right < width
+        or
+        crop_bottom < height
     )
 
     if not changed:
+
         return image, {
             "cropped": False,
             "crop_box": [
