@@ -16,7 +16,6 @@ import numpy as np
 
 from PIL import Image, ImageEnhance
 from paddleocr import PaddleOCR
-from paddleocr import DocImgOrientationClassification
 
 
 # ============================================================
@@ -2442,170 +2441,8 @@ def join_cell_items(
 # 方向模型结果解析
 # ============================================================
 
-def extract_orientation_result(
-    result
-):
-
-    data = result.json
-
-    if (
-        isinstance(data, dict)
-        and "res" in data
-    ):
-
-        data = data["res"]
 
 
-    label = None
-    score = None
-
-
-    labels = data.get(
-        "label_names"
-    )
-
-    scores = data.get(
-        "scores"
-    )
-
-
-    if labels is not None:
-
-        if hasattr(
-            labels,
-            "tolist"
-        ):
-
-            labels = labels.tolist()
-
-        if labels:
-
-            label = str(
-                labels[0]
-            )
-
-
-    if scores is not None:
-
-        if hasattr(
-            scores,
-            "tolist"
-        ):
-
-            scores = scores.tolist()
-
-        if scores:
-
-            score = float(
-                scores[0]
-            )
-
-
-    # 某些版本可能只返回 class_ids
-    if label is None:
-
-        class_ids = data.get(
-            "class_ids"
-        )
-
-        if class_ids is not None:
-
-            if hasattr(
-                class_ids,
-                "tolist"
-            ):
-
-                class_ids = (
-                    class_ids.tolist()
-                )
-
-            if class_ids:
-
-                mapping = {
-                    0: "0",
-                    1: "90",
-                    2: "180",
-                    3: "270",
-                }
-
-                label = mapping.get(
-                    int(
-                        class_ids[0]
-                    )
-                )
-
-
-    if label is None:
-
-        raise RuntimeError(
-            "无法解析方向模型结果"
-        )
-
-
-    # 最终标准化
-    label = label.replace(
-        "°",
-        ""
-    ).strip()
-
-
-    if label not in {
-        "0",
-        "90",
-        "180",
-        "270"
-    }:
-
-        raise RuntimeError(
-            f"未知方向：{label}"
-        )
-
-
-    return (
-        int(label),
-        score
-    )
-
-
-# ============================================================
-# 图像旋转
-#
-# orientation 是“当前图片的方向”
-# 要矫正成正向，因此旋转逆方向。
-# ============================================================
-
-def rotate_image(
-    image,
-    orientation
-):
-
-    if orientation == 0:
-
-        return image.copy()
-
-    if orientation == 90:
-
-        # 顺时针90°
-        return image.transpose(
-            Image.Transpose.ROTATE_270
-        )
-
-    if orientation == 180:
-
-        return image.transpose(
-            Image.Transpose.ROTATE_180
-        )
-
-    if orientation == 270:
-
-        # 逆时针90°
-        return image.transpose(
-            Image.Transpose.ROTATE_90
-        )
-
-    raise ValueError(
-        f"不支持方向：{orientation}"
-    )
 
 
 # ============================================================
@@ -3209,7 +3046,7 @@ def parse_orientation(
     # --------------------------------------------------------
     # 结构评分
     #
-    # 用来判断当前旋转方向是否合理。
+    # 用于判断课程表结构是否合理。
     # --------------------------------------------------------
 
     expected = (
@@ -3310,279 +3147,6 @@ def parse_orientation(
     }
 
 
-# ============================================================
-# 方向自动选择
-# ============================================================
-
-def detect_and_select_orientation(
-    input_path,
-    orientation_model,
-    ocr
-):
-
-    print()
-    print("=" * 78)
-    print("自动检测图片方向")
-    print("=" * 78)
-
-
-    orientation_results = (
-        orientation_model.predict(
-            input_path,
-            batch_size=1
-        )
-    )
-
-
-    if not orientation_results:
-
-        raise RuntimeError(
-            "方向模型没有返回结果"
-        )
-
-
-    predicted_angle, orientation_score = (
-        extract_orientation_result(
-            orientation_results[0]
-        )
-    )
-
-
-    print(
-        f"方向模型判断："
-        f"{predicted_angle}°"
-        f" 置信度="
-        f"{orientation_score:.3f}"
-    )
-
-
-    # --------------------------------------------------------
-    # 第一优先级：
-    # 模型判断的方向
-    #
-    # 如果失败，再尝试其余三个方向。
-    # --------------------------------------------------------
-
-    candidate_angles = [
-        predicted_angle
-    ]
-
-
-    for angle in [
-        0,
-        90,
-        180,
-        270
-    ]:
-
-        if angle not in candidate_angles:
-
-            candidate_angles.append(
-                angle
-            )
-
-
-    original = Image.open(
-        input_path
-    ).convert("RGB")
-
-
-    os.makedirs(
-        OUTPUT_DIR,
-        exist_ok=True
-    )
-
-
-    candidates = []
-
-
-    for angle in candidate_angles:
-
-        print()
-        print(
-            f"尝试方向："
-            f"{angle}°"
-        )
-
-
-        rotated = rotate_image(
-            original,
-            angle
-        )
-
-
-        candidate_path = os.path.join(
-            DEBUG_OUTPUT_DIR,
-            f"_orientation_{angle}.png"
-        )
-
-
-        rotated.save(
-            candidate_path
-        )
-
-
-        start = time.perf_counter()
-
-
-        items, res = run_ocr(
-            ocr,
-            candidate_path
-        )
-
-
-        ocr_time = (
-            time.perf_counter()
-            - start
-        )
-
-
-        parsed = parse_orientation(
-            items
-        )
-
-
-        print(
-            f"OCR耗时："
-            f"{ocr_time:.2f} 秒"
-        )
-
-        print(
-            f"文字区域："
-            f"{len(items)}"
-        )
-
-        print(
-            f"星期列："
-            f"{len(parsed.get('day_columns', []))}"
-        )
-
-        print(
-            f"节次："
-            f"{len(parsed.get('periods', []))}"
-        )
-
-        print(
-            f"有效课程格："
-            f"{parsed.get('non_empty_cells', 0)}"
-        )
-
-        print(
-            f"结构分数："
-            f"{parsed.get('structure_score', 0):.2f}"
-        )
-
-
-        candidates.append({
-            "angle":
-                angle,
-
-            "items":
-                items,
-
-            "result":
-                res,
-
-            "parsed":
-                parsed,
-
-            "ocr_time":
-                ocr_time,
-
-            "image_path":
-                candidate_path
-        })
-
-
-        # ----------------------------------------------------
-        # 如果模型预测方向：
-        # 有结构且识别出了课程
-        # 就直接采用。
-        #
-        # 不再浪费另外三次OCR。
-        # ----------------------------------------------------
-
-        if (
-            angle == predicted_angle
-            and
-            parsed["success"]
-            and
-            parsed["non_empty_cells"] >= 2
-        ):
-
-            print()
-            print(
-                "方向模型判断有效，"
-                "无需尝试其他方向。"
-            )
-
-            return {
-                "selected":
-                    candidates[-1],
-
-                "orientation_angle":
-                    predicted_angle,
-
-                "orientation_score":
-                    orientation_score,
-
-                "all_candidates":
-                    candidates
-            }
-
-
-    # --------------------------------------------------------
-    # 如果预测方向失败：
-    # 从所有方向中选择结构分数最高的
-    # --------------------------------------------------------
-
-    valid_candidates = [
-        x
-        for x
-        in candidates
-        if x["parsed"]["success"]
-    ]
-
-
-    if not valid_candidates:
-
-        return {
-            "selected":
-                None,
-
-            "orientation_angle":
-                predicted_angle,
-
-            "orientation_score":
-                orientation_score,
-
-            "all_candidates":
-                candidates
-        }
-
-
-    selected = max(
-        valid_candidates,
-        key=lambda x:
-        x["parsed"][
-            "structure_score"
-        ]
-    )
-
-
-    return {
-        "selected":
-            selected,
-
-        "orientation_angle":
-            selected["angle"],
-
-        "orientation_score":
-            orientation_score,
-
-        "all_candidates":
-            candidates
-    }
 
 
 # ============================================================
@@ -3796,11 +3360,8 @@ def save_outputs(
         "source_image":
             input_path,
 
-        "selected_rotation":
-            selected["angle"],
-
-        "orientation_confidence":
-            orientation_score,
+        "input_orientation":
+            "upright",
 
         "ocr_time_seconds":
             round(
@@ -3938,12 +3499,12 @@ def save_outputs(
 
 
     # --------------------------------------------------------
-    # 最终正向图片：调试文件
+    # 最终预处理图片：调试文件
     # --------------------------------------------------------
 
     final_image_path = os.path.join(
         DEBUG_OUTPUT_DIR,
-        "oriented_final.png"
+        "preprocessed_final.png"
     )
 
 
@@ -4103,40 +3664,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # 加载方向模型
-    # --------------------------------------------------------
-
-    print()
-    print(
-        "正在加载文档方向模型..."
-    )
-
-
-    orientation_start = (
-        time.perf_counter()
-    )
-
-
-    orientation_model = (
-        DocImgOrientationClassification(
-            model_name=
-                "PP-LCNet_x1_0_doc_ori",
-
-            device=
-                "cpu"
-        )
-    )
-
-
-    print(
-        "方向模型加载完成："
-        f"{time.perf_counter() - orientation_start:.2f}"
-        " 秒"
-    )
-
-
-    # --------------------------------------------------------
-    # 加载OCR
+    # 加载 OCR 模型
     # --------------------------------------------------------
 
     print()
@@ -4144,11 +3672,9 @@ def main():
         "正在加载 OCR 模型..."
     )
 
-
     ocr_start = (
         time.perf_counter()
     )
-
 
     ocr = PaddleOCR(
 
@@ -4174,7 +3700,6 @@ def main():
             "paddle"
     )
 
-
     print(
         "OCR模型加载完成："
         f"{time.perf_counter() - ocr_start:.2f}"
@@ -4183,61 +3708,97 @@ def main():
 
 
     # --------------------------------------------------------
-    # 自动方向 + OCR + 解析
+    # 单次 OCR + 课程表解析
     # --------------------------------------------------------
 
     start_total = (
         time.perf_counter()
     )
 
-
-    result = (
-        detect_and_select_orientation(
-            preprocessed_path,
-            orientation_model,
-            ocr
-        )
+    ocr_run_start = (
+        time.perf_counter()
     )
 
+    items, res = run_ocr(
+        ocr,
+        preprocessed_path
+    )
+
+    ocr_time = (
+        time.perf_counter()
+        - ocr_run_start
+    )
+
+    parsed = parse_orientation(
+        items
+    )
+
+    print()
+    print("=" * 78)
+    print("OCR与课程表解析")
+    print("=" * 78)
+
+    print(
+        f"OCR耗时："
+        f"{ocr_time:.2f} 秒"
+    )
+
+    print(
+        f"文字区域："
+        f"{len(items)}"
+    )
+
+    print(
+        f"星期列："
+        f"{len(parsed.get('day_columns', []))}"
+    )
+
+    print(
+        f"节次："
+        f"{len(parsed.get('periods', []))}"
+    )
+
+    print(
+        f"有效课程格："
+        f"{parsed.get('non_empty_cells', 0)}"
+    )
+
+    print(
+        f"结构分数："
+        f"{parsed.get('structure_score', 0):.2f}"
+    )
 
     total_time = (
         time.perf_counter()
         - start_total
     )
 
+    selected = {
+        "angle": 0,
+        "items": items,
+        "result": res,
+        "parsed": parsed,
+        "ocr_time": ocr_time,
+        "image_path": preprocessed_path
+    }
 
-    selected = result[
-        "selected"
-    ]
-
-
-    if selected is None:
-
+    if not parsed.get("success"):
         print()
         print("=" * 78)
         print("无法可靠解析课程表")
         print("=" * 78)
 
         print(
-            f"方向模型判断："
-            f"{result['orientation_angle']}°"
+            f"原因："
+            f"{parsed.get('reason', '未知错误')}"
         )
 
         print(
-            f"方向置信度："
-            f"{result['orientation_score']:.3f}"
-        )
-
-        print()
-        print(
-            "建议检查原图，"
-            "或者下一步接入 "
-            "PP-StructureV3 "
-            "作为复杂版式备用方案。"
+            "程序不会输出新的有效课程表，"
+            "请检查图片是否清晰、课程表是否为正向。"
         )
 
         sys.exit(2)
-
 
     # --------------------------------------------------------
     # 输出
@@ -4246,9 +3807,7 @@ def main():
     outputs = save_outputs(
         selected,
         IMAGE_PATH,
-        result[
-            "orientation_score"
-        ]
+        0.0
     )
 
 
@@ -4335,14 +3894,7 @@ def main():
 
 
     print(
-        f"自动选择旋转："
-        f"{selected['angle']}°"
-    )
-
-
-    print(
-        f"方向模型置信度："
-        f"{result['orientation_score']:.3f}"
+        "图片方向：默认正向，不进行自动旋转"
     )
 
 
