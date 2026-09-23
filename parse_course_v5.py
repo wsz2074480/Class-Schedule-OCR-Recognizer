@@ -21,6 +21,8 @@ from paddleocr import DocImgOrientationClassification
 # 配置
 # ============================================================
 
+# 默认直接运行时使用 test.png。
+# 如果通过 BAT 拖入图片，则由 main() 用命令行参数覆盖。
 IMAGE_PATH = "test.png"
 
 # output：只放最终交付的 XLSX
@@ -3502,9 +3504,42 @@ def save_outputs(
 
 def main():
 
+    global IMAGE_PATH
+
+    # --------------------------------------------------------
+    # 命令行图片参数
+    # --------------------------------------------------------
+    #
+    # 直接运行：
+    #     python parse_course_v5.py
+    #     -> 使用 test.png
+    #
+    # 拖拽图片到 BAT：
+    #     BAT 会把图片完整路径作为第一个参数传进来。
+    #
+    # 支持路径中包含空格。
+    #
+    if len(sys.argv) > 1:
+
+        IMAGE_PATH = os.path.abspath(
+            sys.argv[1]
+        )
+
+    else:
+
+        IMAGE_PATH = os.path.abspath(
+            IMAGE_PATH
+        )
+
+
     print("=" * 78)
     print("PaddleOCR V5 课程表解析器")
     print("=" * 78)
+
+
+    print(
+        f"输入图片：{IMAGE_PATH}"
+    )
 
 
     # --------------------------------------------------------
