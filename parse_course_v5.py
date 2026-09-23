@@ -1646,17 +1646,22 @@ def infer_teacher_names(items):
     """
     从整张课表的有效 OCR 项目中推断教师姓名。
 
-    规则：
-    1. 单独 OCR 出来的 2~3 字姓名，直接纳入。
-    2. 文本末尾的姓名，按“课程 + 教师”处理。
-    3. 文本开头的姓名需要重复出现或同时具备首尾姓名证据，
-       避免误删课程名称。
+    重要：
+    2字中文文本本身存在较大歧义，例如“班队”。
+    因此：
+      - 3字姓名可以直接作为强候选；
+      - 2字姓名若出现在“课程+姓名”末尾，可以作为候选；
+      - 单独出现的2字姓名，必须结合“位于同一课程格、且明显在另一文字下方”
+        或“重复出现”等证据，避免误删课程词。
     """
 
     exact_counts = Counter()
     suffix_counts = Counter()
     prefix_counts = Counter()
     edge_positions = {}
+
+    # 单独出现的 2 字姓名，需要保存位置，后面结合课程格判断。
+    standalone_two_char = []
 
     for item in items:
 
@@ -1677,7 +1682,11 @@ def infer_teacher_names(items):
             continue
 
         if is_name_like(compact):
+
             exact_counts[compact] += 1
+
+            if len(compact) == 2:
+                standalone_two_char.append(item)
 
         candidates = extract_edge_name_candidates(
             compact
@@ -1701,8 +1710,7 @@ def infer_teacher_names(items):
                 prefix_counts[name] += 1
 
         # 一个 OCR 框里同时出现两个姓名，
-        # 例如：姜家欢唱游·乐潘姝玥
-        # 可增强前缀人名的可信度。
+        # 例如：姜家欢唱游·乐潘姝玥。
         if len(names_in_item) >= 2:
 
             for name in names_in_item:
@@ -1716,15 +1724,93 @@ def infer_teacher_names(items):
 
     teacher_names = set()
 
-    # 单独识别出的姓名。
+    # --------------------------------------------------------
+    # 1. 3字独立姓名：强候选
+    # 2字独立文本不能仅凭“像姓名”直接删除。
+    # --------------------------------------------------------
     for name in exact_counts:
-        teacher_names.add(name)
 
-    # 课程 + 教师：末尾姓名是最典型情况。
+        if len(name) >= 3:
+            teacher_names.add(name)
+
+    # --------------------------------------------------------
+    # 2. 单独出现的2字姓名：
+    # 如果它在同一个课程格里明显位于另一段文字下方，
+    # 则很像“课程在上、教师在下”的版式。
+    # --------------------------------------------------------
+    for item in standalone_two_char:
+
+        name = re.sub(
+            r"\s+",
+            "",
+            item["text"]
+        )
+
+        same_cell_items = []
+
+        for other in items:
+
+            if other is item:
+                continue
+
+            if (
+                other.get("period_number")
+                !=
+                item.get("period_number")
+            ):
+                continue
+
+            item_days = set(
+                item.get(
+                    "day_indices",
+                    []
+                )
+            )
+
+            other_days = set(
+                other.get(
+                    "day_indices",
+                    []
+                )
+            )
+
+            if not (
+                item_days
+                &
+                other_days
+            ):
+                continue
+
+            same_cell_items.append(
+                other
+            )
+
+        has_upper_text = any(
+            other["cy"]
+            <
+            item["cy"] - 8
+            for other
+            in same_cell_items
+            if other.get("text")
+        )
+
+        if has_upper_text:
+            teacher_names.add(name)
+
+    # --------------------------------------------------------
+    # 3. “课程 + 教师”：
+    # 尾部姓名是目前最可靠的组合形式。
+    # --------------------------------------------------------
     for name in suffix_counts:
+
+        # 两字姓名也允许，例如：
+        # 英语赵静
         teacher_names.add(name)
 
-    # 教师 + 课程：需要更多证据。
+    # --------------------------------------------------------
+    # 4. “教师 + 课程”：
+    # 需要更多证据，避免课程词误判。
+    # --------------------------------------------------------
     for name, count in prefix_counts.items():
 
         positions = edge_positions.get(
@@ -1733,16 +1819,19 @@ def infer_teacher_names(items):
         )
 
         if (
-            exact_counts.get(name, 0) > 0
-            or
-            count >= 2
-            or
-            "multi_name" in positions
+            len(name) >= 3
+            and
+            (
+                exact_counts.get(name, 0) > 0
+                or
+                count >= 2
+                or
+                "multi_name" in positions
+            )
         ):
             teacher_names.add(name)
 
     return teacher_names
-
 
 def remove_teacher_names(
     text,
