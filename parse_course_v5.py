@@ -79,6 +79,18 @@ UPSCALE_MAX_FACTOR = 2.5
 # 放大后最长边的上限，避免极大图片造成不必要的 CPU 开销。
 UPSCALE_MAX_LONG_SIDE = 3600
 
+# OCR 去噪：去掉文字周围的孤立杂点，同时尽量保留中文笔画。
+OCR_MEDIAN_FILTER_SIZE = 3
+
+# 局部背景估计半径，用于消除纸张纹理和拍照明暗不均。
+OCR_BACKGROUND_BLUR_RADIUS = 8
+
+# 局部前景对比增强倍率。
+OCR_LOCAL_CONTRAST_FACTOR = 1.35
+
+# 最终整体对比度。
+OCR_GLOBAL_CONTRAST_FACTOR = 1.08
+
 
 # ============================================================
 # 非课程信息
@@ -1007,7 +1019,7 @@ def _upscale_if_needed(image):
     return (
         image.resize(
             new_size,
-            Image.Resampling.LANCZOS
+            Image.Resampling.BICUBIC
         ),
         {
             "upscaled": True,
@@ -1020,10 +1032,14 @@ def _enhance_for_ocr(image, should_enhance):
     """
     OCR 专用图像增强：
 
-    1. 灰度化，减少彩色背景对检测的干扰；
-    2. 自动拉伸对比度，提升浅灰文字/表格线；
-    3. 轻度锐化，增强小字边缘；
-    4. 不做激进二值化，避免中文细笔画损失。
+    1. 灰度化；
+    2. 3x3 中值滤波去掉文字周围的孤立杂点；
+    3. 用高斯模糊估计局部纸张背景，并进行背景归一化；
+    4. 轻度自动对比度；
+    5. 不做激进二值化，也不使用高强度锐化。
+
+    原来的高强度锐化会把杂点一起增强，反而可能降低小字 OCR
+    的检测稳定性。
     """
 
     if not should_enhance:
@@ -1033,21 +1049,62 @@ def _enhance_for_ocr(image, should_enhance):
         image
     )
 
+    denoised = gray.filter(
+        ImageFilter.MedianFilter(
+            size=OCR_MEDIAN_FILTER_SIZE
+        )
+    )
+
+    gray_array = np.asarray(
+        denoised,
+        dtype=np.float32
+    )
+
+    background = np.asarray(
+        denoised.filter(
+            ImageFilter.GaussianBlur(
+                radius=OCR_BACKGROUND_BLUR_RADIUS
+            )
+        ),
+        dtype=np.float32
+    )
+
+    background_level = float(
+        np.median(background)
+    )
+
+    corrected = (
+        background_level
+        +
+        (
+            gray_array
+            - background
+        )
+        * OCR_LOCAL_CONTRAST_FACTOR
+    )
+
+    corrected = np.clip(
+        corrected,
+        0,
+        255
+    ).astype(
+        np.uint8
+    )
+
+    enhanced = Image.fromarray(
+        corrected,
+        mode="L"
+    )
+
     enhanced = ImageOps.autocontrast(
-        gray,
+        enhanced,
         cutoff=1
     )
 
     enhanced = ImageEnhance.Contrast(
         enhanced
-    ).enhance(1.10)
-
-    enhanced = enhanced.filter(
-        ImageFilter.UnsharpMask(
-            radius=1.0,
-            percent=130,
-            threshold=3
-        )
+    ).enhance(
+        OCR_GLOBAL_CONTRAST_FACTOR
     )
 
     return enhanced.convert(
@@ -1154,6 +1211,14 @@ def preprocess_input_image(input_path):
             content_info[
                 "threshold"
             ],
+        "ocr_denoise":
+            bool(
+                crop_info["cropped"]
+                or
+                content_info["cropped"]
+                or
+                resize_info["upscaled"]
+            ),
         "upscaled": resize_info[
             "upscaled"
         ],
