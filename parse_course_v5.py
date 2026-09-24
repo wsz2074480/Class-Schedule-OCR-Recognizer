@@ -14,7 +14,7 @@ from statistics import median
 
 import numpy as np
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance
 from paddleocr import PaddleOCR
 
 
@@ -41,36 +41,31 @@ PERIOD_MATCH_RATIO = 0.45
 ROW_CLUSTER_MAX_DISTANCE = 45
 
 # ============================================================
-# V5.2 图像预处理
+# V5.3 图像预处理
 # ============================================================
 
 # 黑边判断：边缘像素中低亮度像素占比达到此值时，认为这一行/列可能是黑边。
-# 适当放宽到 75%，兼容 JPEG 压缩、截图黑边边缘存在少量杂色的情况。
 BLACK_BORDER_DARK_RATIO = 0.75
 
 # “黑色”阈值，0~255。
 BLACK_BORDER_LUMINANCE = 55
 
 # 如果整行/整列的平均亮度足够低，也视为黑边。
-# 用于兼容“黑边不是纯黑”或存在少量亮色噪点的图片。
 BLACK_BORDER_MEAN_LUMINANCE = 90
 
 # 单边最多裁掉图片尺寸的比例。
-# 课程表图片可能上下都有非常宽的黑色留白，因此不能限制在 35%。
 MAX_BORDER_CROP_RATIO = 0.45
 
-# 自动裁边后，至少保留原尺寸的这一比例，避免异常图片被裁成极薄区域。
+# 自动裁边后，至少保留原尺寸的这一比例。
 MIN_REMAINING_RATIO = 0.20
 
-# 白边/空白边检测：
-# 通过“与外缘背景相比明显更暗的像素”寻找真正内容区域。
+# 白边/空白边检测的最小亮度对比。
 WHITE_BORDER_MIN_CONTRAST = 12
 
 # 行/列中至少有这么多比例的前景像素，才认为这一行/列属于内容。
 CONTENT_DARK_RATIO = 0.003
 
 # 小图的目标最小边长。低于此值时自动放大。
-# 先裁掉黑/白边再放大，能把真正文字放得更大。
 UPSCALE_TARGET_MIN_DIM = 1600
 
 # 最大放大倍数。
@@ -79,17 +74,29 @@ UPSCALE_MAX_FACTOR = 2.5
 # 放大后最长边的上限，避免极大图片造成不必要的 CPU 开销。
 UPSCALE_MAX_LONG_SIDE = 3600
 
-# OCR 去噪：去掉文字周围的孤立杂点，同时尽量保留中文笔画。
-OCR_MEDIAN_FILTER_SIZE = 3
+# ------------------------------------------------------------
+# OCR 图像增强
+#
+# 参考成熟深度学习 OCR 的做法：
+# - 默认保留原始 RGB；
+# - 只在检测到“整体对比度明显偏低”时做轻度增强；
+# - 增强只作用于亮度通道，不破坏原始颜色；
+# - 不默认执行中值滤波、局部背景模糊、强制灰度、激进二值化。
+#
+# 百分位对比度 = P90 - P10。
+# 该值越低，通常表示整张图片的文字/背景亮度分离越弱。
+# ------------------------------------------------------------
 
-# 局部背景估计半径，用于消除纸张纹理和拍照明暗不均。
-OCR_BACKGROUND_BLUR_RADIUS = 8
+# 用于快速估计对比度的最大探测边长。
+OCR_CONTRAST_PROBE_MAX = 900
 
-# 局部前景对比增强倍率。
-OCR_LOCAL_CONTRAST_FACTOR = 1.35
+# P90-P10 低于此值时，才认为需要轻度增强。
+# 数值越高，越容易触发增强。
+OCR_LOW_CONTRAST_THRESHOLD = 65
 
-# 最终整体对比度。
-OCR_GLOBAL_CONTRAST_FACTOR = 1.08
+# 低对比度图片的轻度亮度对比增强倍率。
+# 建议先在 1.10~1.25 范围内调整。
+OCR_LOW_CONTRAST_FACTOR = 1.18
 
 
 # ============================================================
@@ -1028,95 +1035,143 @@ def _upscale_if_needed(image):
     )
 
 
-def _enhance_for_ocr(image, should_enhance):
+def _measure_luminance_contrast(image):
     """
-    OCR 专用图像增强：
+    快速测量图片整体亮度对比度。
 
-    1. 灰度化；
-    2. 3x3 中值滤波去掉文字周围的孤立杂点；
-    3. 用高斯模糊估计局部纸张背景，并进行背景归一化；
-    4. 轻度自动对比度；
-    5. 不做激进二值化，也不使用高强度锐化。
+    不对整张高分辨率图片计算百分位，而是先缩小到最多
+    OCR_CONTRAST_PROBE_MAX 的长边，降低 CPU 开销。
 
-    原来的高强度锐化会把杂点一起增强，反而可能降低小字 OCR
-    的检测稳定性。
+    返回：
+        {
+            "p10": ...,
+            "p90": ...,
+            "contrast": ...
+        }
     """
 
-    if not should_enhance:
-        return image
+    width, height = image.size
 
-    gray = ImageOps.grayscale(
+    scale = min(
+        1.0,
+        OCR_CONTRAST_PROBE_MAX
+        / max(width, height)
+    )
+
+    if scale < 1.0:
+        probe = image.resize(
+            (
+                max(1, int(width * scale)),
+                max(1, int(height * scale))
+            ),
+            Image.Resampling.BILINEAR
+        )
+    else:
+        probe = image
+
+    gray = np.asarray(
+        probe.convert("L"),
+        dtype=np.uint8
+    )
+
+    p10, p90 = np.percentile(
+        gray,
+        [10, 90]
+    )
+
+    return {
+        "p10": round(float(p10), 1),
+        "p90": round(float(p90), 1),
+        "contrast": round(
+            float(p90 - p10),
+            1
+        )
+    }
+
+
+def _enhance_for_ocr(image):
+    """
+    V5.3 OCR 图像增强。
+
+    核心原则：
+    1. 默认保留原始 RGB；
+    2. 默认不做灰度化、MedianFilter、Gaussian 背景校正或强制
+       autocontrast；
+    3. 先快速测量整体亮度对比度；
+    4. 只有明显低对比度时，才对 Y（亮度）通道做轻度 Contrast；
+    5. Cb/Cr（颜色）完全来自原图，从而保留原始颜色。
+
+    这样更接近现代深度学习 OCR 常见的“Resize + Normalize”
+    路线，同时保留 EasyOCR 一类项目的“低对比度时再增强”的思路。
+    """
+
+    contrast_info = _measure_luminance_contrast(
         image
     )
 
-    denoised = gray.filter(
-        ImageFilter.MedianFilter(
-            size=OCR_MEDIAN_FILTER_SIZE
+    contrast = contrast_info["contrast"]
+
+    if contrast >= OCR_LOW_CONTRAST_THRESHOLD:
+        return (
+            image,
+            {
+                **contrast_info,
+                "enhanced": False,
+                "factor": 1.0,
+                "reason": "对比度足够，无需额外增强"
+            }
         )
+
+    # 只处理亮度通道，保留原始色彩。
+    ycbcr = image.convert(
+        "YCbCr"
     )
 
-    gray_array = np.asarray(
-        denoised,
-        dtype=np.float32
-    )
+    y, cb, cr = ycbcr.split()
 
-    background = np.asarray(
-        denoised.filter(
-            ImageFilter.GaussianBlur(
-                radius=OCR_BACKGROUND_BLUR_RADIUS
-            )
-        ),
-        dtype=np.float32
-    )
-
-    background_level = float(
-        np.median(background)
-    )
-
-    corrected = (
-        background_level
-        +
-        (
-            gray_array
-            - background
-        )
-        * OCR_LOCAL_CONTRAST_FACTOR
-    )
-
-    corrected = np.clip(
-        corrected,
-        0,
-        255
-    ).astype(
-        np.uint8
-    )
-
-    enhanced = Image.fromarray(
-        corrected,
-        mode="L"
-    )
-
-    enhanced = ImageOps.autocontrast(
-        enhanced,
-        cutoff=1
-    )
-
-    enhanced = ImageEnhance.Contrast(
-        enhanced
+    enhanced_y = ImageEnhance.Contrast(
+        y
     ).enhance(
-        OCR_GLOBAL_CONTRAST_FACTOR
+        OCR_LOW_CONTRAST_FACTOR
     )
 
-    return enhanced.convert(
+    enhanced = Image.merge(
+        "YCbCr",
+        (
+            enhanced_y,
+            cb,
+            cr
+        )
+    ).convert(
         "RGB"
+    )
+
+    after = _measure_luminance_contrast(
+        enhanced
+    )
+
+    return (
+        enhanced,
+        {
+            **after,
+            "before_p10": contrast_info["p10"],
+            "before_p90": contrast_info["p90"],
+            "before_contrast": contrast_info["contrast"],
+            "enhanced": True,
+            "factor": OCR_LOW_CONTRAST_FACTOR,
+            "reason": (
+                f"低对比度，亮度通道增强 "
+                f"{OCR_LOW_CONTRAST_FACTOR:.2f}x"
+            )
+        }
     )
 
 
 def preprocess_input_image(input_path):
     """
-    V5.2 主预处理：
+    V5.3 主预处理：
 
-        原图
+        原图 RGB
           ↓
         自动去黑边
           ↓
@@ -1124,7 +1179,9 @@ def preprocess_input_image(input_path):
           ↓
         小图按需放大
           ↓
-        灰度 + 自动对比度 + 轻度锐化
+        检测整体对比度
+          ↓
+        仅低对比度时对亮度通道做轻度增强
           ↓
         保存到 debug_output
 
@@ -1156,15 +1213,9 @@ def preprocess_input_image(input_path):
     )
 
     # OCR 专用增强：
-    # 先灰度 + 自动对比度，再轻度锐化。
-    # 不做激进二值化，避免中文细笔画被吃掉。
-    processed = _enhance_for_ocr(
-        resized,
-        crop_info["cropped"]
-        or
-        content_info["cropped"]
-        or
-        resize_info["upscaled"]
+    # 默认保持 RGB；只有低对比度图片才对亮度通道做轻度增强。
+    processed, enhance_info = _enhance_for_ocr(
+        resized
     )
 
     os.makedirs(
@@ -1212,13 +1263,22 @@ def preprocess_input_image(input_path):
                 "threshold"
             ],
         "ocr_denoise":
-            bool(
-                crop_info["cropped"]
-                or
-                content_info["cropped"]
-                or
-                resize_info["upscaled"]
+            False,
+        "ocr_contrast_enhanced":
+            enhance_info["enhanced"],
+        "ocr_contrast_reason":
+            enhance_info["reason"],
+        "ocr_contrast_before":
+            enhance_info.get(
+                "before_contrast",
+                enhance_info["contrast"]
             ),
+        "ocr_contrast_after":
+            enhance_info["contrast"],
+        "ocr_contrast_threshold":
+            OCR_LOW_CONTRAST_THRESHOLD,
+        "ocr_contrast_factor":
+            enhance_info["factor"],
         "upscaled": resize_info[
             "upscaled"
         ],
@@ -4063,7 +4123,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # V5.2 图像预处理
+    # V5.3 图像预处理
     # --------------------------------------------------------
 
     print()
@@ -4137,6 +4197,16 @@ def main():
     else:
         print(
             "无需放大图片"
+        )
+
+    if preprocess_info["ocr_contrast_enhanced"]:
+        print(
+            "检测到低对比度，已对亮度通道做轻度增强："
+            f"{preprocess_info['ocr_contrast_factor']:.2f}x"
+        )
+    else:
+        print(
+            "对比度正常：不做额外 OCR 图像增强"
         )
 
 
