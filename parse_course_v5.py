@@ -14,7 +14,7 @@ from statistics import median
 
 import numpy as np
 
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from paddleocr import PaddleOCR
 
 
@@ -62,14 +62,22 @@ MAX_BORDER_CROP_RATIO = 0.45
 # 自动裁边后，至少保留原尺寸的这一比例，避免异常图片被裁成极薄区域。
 MIN_REMAINING_RATIO = 0.20
 
+# 白边/空白边检测：
+# 通过“与外缘背景相比明显更暗的像素”寻找真正内容区域。
+WHITE_BORDER_MIN_CONTRAST = 12
+
+# 行/列中至少有这么多比例的前景像素，才认为这一行/列属于内容。
+CONTENT_DARK_RATIO = 0.003
+
 # 小图的目标最小边长。低于此值时自动放大。
-UPSCALE_TARGET_MIN_DIM = 1400
+# 先裁掉黑/白边再放大，能把真正文字放得更大。
+UPSCALE_TARGET_MIN_DIM = 1600
 
 # 最大放大倍数。
-UPSCALE_MAX_FACTOR = 2.0
+UPSCALE_MAX_FACTOR = 2.5
 
 # 放大后最长边的上限，避免极大图片造成不必要的 CPU 开销。
-UPSCALE_MAX_LONG_SIDE = 3200
+UPSCALE_MAX_LONG_SIDE = 3600
 
 
 # ============================================================
@@ -669,6 +677,271 @@ def _find_dark_border_crop(image):
     }
 
 
+def _find_content_crop(image):
+    """
+    自动裁掉四周大面积白边/浅色空白。
+
+    思路：
+    - 黑边先由 _find_dark_border_crop() 处理；
+    - 这里再从剩余图片的四周背景估计“纸张/空白”的亮度；
+    - 找出相对背景明显更暗的文字、表格线、印章等内容；
+    - 依据行/列前景密度得到内容包围盒。
+
+    即使原图没有黑边、只有白边，也可以自动缩紧到真正内容区域。
+    """
+
+    width, height = image.size
+
+    max_probe = 900
+
+    scale = min(
+        1.0,
+        max_probe / max(width, height)
+    )
+
+    if scale < 1.0:
+        probe = image.resize(
+            (
+                max(1, int(width * scale)),
+                max(1, int(height * scale))
+            ),
+            Image.Resampling.BILINEAR
+        )
+    else:
+        probe = image
+
+    gray = np.asarray(
+        probe.convert("L"),
+        dtype=np.uint8
+    )
+
+    ph, pw = gray.shape
+
+    # 从四个角落估计空白背景亮度。
+    band_x = max(1, int(pw * 0.06))
+    band_y = max(1, int(ph * 0.06))
+
+    corner_pixels = np.concatenate([
+        gray[:band_y, :band_x].reshape(-1),
+        gray[:band_y, pw - band_x:].reshape(-1),
+        gray[ph - band_y:, :band_x].reshape(-1),
+        gray[ph - band_y:, pw - band_x:].reshape(-1),
+    ])
+
+    background_luminance = float(
+        np.median(corner_pixels)
+    )
+
+    threshold = (
+        background_luminance
+        - WHITE_BORDER_MIN_CONTRAST
+    )
+
+    threshold = max(
+        120.0,
+        min(
+            245.0,
+            threshold
+        )
+    )
+
+    foreground = (
+        gray < threshold
+    )
+
+    row_density = (
+        foreground.mean(axis=1)
+    )
+
+    column_density = (
+        foreground.mean(axis=0)
+    )
+
+    row_indices = np.where(
+        row_density >= CONTENT_DARK_RATIO
+    )[0]
+
+    column_indices = np.where(
+        column_density >= CONTENT_DARK_RATIO
+    )[0]
+
+    if (
+        len(row_indices) == 0
+        or
+        len(column_indices) == 0
+    ):
+        return image, {
+            "cropped": False,
+            "crop_box": [
+                0,
+                0,
+                width,
+                height
+            ],
+            "background_luminance":
+                round(
+                    background_luminance,
+                    1
+                ),
+            "threshold":
+                round(
+                    threshold,
+                    1
+                )
+        }
+
+    left = int(
+        round(
+            column_indices[0]
+            / scale
+        )
+    )
+
+    top = int(
+        round(
+            row_indices[0]
+            / scale
+        )
+    )
+
+    right = int(
+        round(
+            (column_indices[-1] + 1)
+            / scale
+        )
+    )
+
+    bottom = int(
+        round(
+            (row_indices[-1] + 1)
+            / scale
+        )
+    )
+
+    left = max(
+        0,
+        min(
+            left,
+            width - 1
+        )
+    )
+
+    top = max(
+        0,
+        min(
+            top,
+            height - 1
+        )
+    )
+
+    right = max(
+        left + 1,
+        min(
+            right,
+            width
+        )
+    )
+
+    bottom = max(
+        top + 1,
+        min(
+            bottom,
+            height
+        )
+    )
+
+    changed = (
+        left > 0
+        or
+        top > 0
+        or
+        right < width
+        or
+        bottom < height
+    )
+
+    if not changed:
+        return image, {
+            "cropped": False,
+            "crop_box": [
+                0,
+                0,
+                width,
+                height
+            ],
+            "background_luminance":
+                round(
+                    background_luminance,
+                    1
+                ),
+            "threshold":
+                round(
+                    threshold,
+                    1
+                )
+        }
+
+    # 给边缘内容留少量安全边距。
+    pad_x = max(
+        3,
+        int(width * 0.01)
+    )
+
+    pad_y = max(
+        3,
+        int(height * 0.01)
+    )
+
+    left = max(
+        0,
+        left - pad_x
+    )
+
+    top = max(
+        0,
+        top - pad_y
+    )
+
+    right = min(
+        width,
+        right + pad_x
+    )
+
+    bottom = min(
+        height,
+        bottom + pad_y
+    )
+
+    cropped = image.crop(
+        (
+            left,
+            top,
+            right,
+            bottom
+        )
+    )
+
+    return cropped, {
+        "cropped": True,
+        "crop_box": [
+            left,
+            top,
+            right,
+            bottom
+        ],
+        "background_luminance":
+            round(
+                background_luminance,
+                1
+            ),
+        "threshold":
+            round(
+                threshold,
+                1
+            )
+    }
+
+
 def _upscale_if_needed(image):
     """
     小图片自动放大，正常大图不处理。
@@ -745,21 +1018,41 @@ def _upscale_if_needed(image):
 
 def _enhance_for_ocr(image, should_enhance):
     """
-    轻度增强，不做激进二值化。
+    OCR 专用图像增强：
+
+    1. 灰度化，减少彩色背景对检测的干扰；
+    2. 自动拉伸对比度，提升浅灰文字/表格线；
+    3. 轻度锐化，增强小字边缘；
+    4. 不做激进二值化，避免中文细笔画损失。
     """
 
     if not should_enhance:
         return image
 
-    enhanced = ImageEnhance.Contrast(
+    gray = ImageOps.grayscale(
         image
-    ).enhance(1.08)
+    )
 
-    enhanced = ImageEnhance.Sharpness(
+    enhanced = ImageOps.autocontrast(
+        gray,
+        cutoff=1
+    )
+
+    enhanced = ImageEnhance.Contrast(
         enhanced
-    ).enhance(1.15)
+    ).enhance(1.10)
 
-    return enhanced
+    enhanced = enhanced.filter(
+        ImageFilter.UnsharpMask(
+            radius=1.0,
+            percent=130,
+            threshold=3
+        )
+    )
+
+    return enhanced.convert(
+        "RGB"
+    )
 
 
 def preprocess_input_image(input_path):
@@ -770,9 +1063,11 @@ def preprocess_input_image(input_path):
           ↓
         自动去黑边
           ↓
+        自动去白边/空白边
+          ↓
         小图按需放大
           ↓
-        小图/放大图轻度增强
+        灰度 + 自动对比度 + 轻度锐化
           ↓
         保存到 debug_output
 
@@ -791,16 +1086,26 @@ def preprocess_input_image(input_path):
         )
     )
 
-    resized, resize_info = (
-        _upscale_if_needed(
+    content_cropped, content_info = (
+        _find_content_crop(
             cropped
         )
     )
 
-    # 只在图像确实被裁剪或放大的情况下进行轻度增强。
+    resized, resize_info = (
+        _upscale_if_needed(
+            content_cropped
+        )
+    )
+
+    # OCR 专用增强：
+    # 先灰度 + 自动对比度，再轻度锐化。
+    # 不做激进二值化，避免中文细笔画被吃掉。
     processed = _enhance_for_ocr(
         resized,
         crop_info["cropped"]
+        or
+        content_info["cropped"]
         or
         resize_info["upscaled"]
     )
@@ -835,6 +1140,20 @@ def preprocess_input_image(input_path):
         "detected_border_runs": crop_info[
             "detected_border_runs"
         ],
+        "content_cropped": content_info[
+            "cropped"
+        ],
+        "content_crop_box": content_info[
+            "crop_box"
+        ],
+        "content_background_luminance":
+            content_info[
+                "background_luminance"
+            ],
+        "content_threshold":
+            content_info[
+                "threshold"
+            ],
         "upscaled": resize_info[
             "upscaled"
         ],
@@ -3733,6 +4052,16 @@ def main():
     else:
         print(
             "未检测到需要裁剪的黑边"
+        )
+
+    if preprocess_info["content_cropped"]:
+        print(
+            f"检测到白边/空白边并自动裁剪："
+            f"{preprocess_info['content_crop_box']}"
+        )
+    else:
+        print(
+            "未检测到需要裁剪的白边/空白边"
         )
 
     if preprocess_info["upscaled"]:
