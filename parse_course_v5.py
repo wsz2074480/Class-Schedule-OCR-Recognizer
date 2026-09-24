@@ -3297,7 +3297,8 @@ def save_xlsx(
 def save_outputs(
     selected,
     input_path,
-    orientation_score
+    orientation_score,
+    preprocess_info=None
 ):
 
     parsed = selected[
@@ -3372,14 +3373,13 @@ def save_outputs(
             ),
 
         "preprocess":
-            {
-                **preprocess_info,
-                "time_seconds":
-                    round(
-                        preprocess_time,
-                        3
-                    )
-            },
+            (
+                {
+                    **preprocess_info
+                }
+                if preprocess_info is not None
+                else {}
+            ),
 
         "days":
             [
@@ -3807,7 +3807,8 @@ def main():
     outputs = save_outputs(
         selected,
         IMAGE_PATH,
-        0.0
+        0.0,
+        preprocess_info
     )
 
 
