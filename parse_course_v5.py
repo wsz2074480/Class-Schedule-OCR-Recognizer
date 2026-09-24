@@ -45,13 +45,22 @@ ROW_CLUSTER_MAX_DISTANCE = 45
 # ============================================================
 
 # 黑边判断：边缘像素中低亮度像素占比达到此值时，认为这一行/列可能是黑边。
-BLACK_BORDER_DARK_RATIO = 0.90
+# 适当放宽到 75%，兼容 JPEG 压缩、截图黑边边缘存在少量杂色的情况。
+BLACK_BORDER_DARK_RATIO = 0.75
 
 # “黑色”阈值，0~255。
 BLACK_BORDER_LUMINANCE = 55
 
-# 单次最多裁掉图片尺寸的比例，防止异常图片被过度裁剪。
-MAX_BORDER_CROP_RATIO = 0.35
+# 如果整行/整列的平均亮度足够低，也视为黑边。
+# 用于兼容“黑边不是纯黑”或存在少量亮色噪点的图片。
+BLACK_BORDER_MEAN_LUMINANCE = 90
+
+# 单边最多裁掉图片尺寸的比例。
+# 课程表图片可能上下都有非常宽的黑色留白，因此不能限制在 35%。
+MAX_BORDER_CROP_RATIO = 0.45
+
+# 自动裁边后，至少保留原尺寸的这一比例，避免异常图片被裁成极薄区域。
+MIN_REMAINING_RATIO = 0.20
 
 # 小图的目标最小边长。低于此值时自动放大。
 UPSCALE_TARGET_MIN_DIM = 1400
@@ -390,6 +399,16 @@ def _find_dark_border_crop(image):
         dark_mask.mean(axis=1)
     )
 
+    # 再计算整行/整列平均亮度。
+    # 对“整体很黑但混有少量亮色像素”的 JPEG / 截图黑边更稳健。
+    column_mean_luminance = (
+        gray_array.mean(axis=0)
+    )
+
+    row_mean_luminance = (
+        gray_array.mean(axis=1)
+    )
+
     pw = gray_array.shape[1]
     ph = gray_array.shape[0]
 
@@ -401,7 +420,23 @@ def _find_dark_border_crop(image):
         ph * MAX_BORDER_CROP_RATIO
     )
 
-    def find_left_run(ratios, max_count):
+    def is_dark_edge(
+        dark_ratio,
+        mean_luminance
+    ):
+        return (
+            dark_ratio
+            >= BLACK_BORDER_DARK_RATIO
+            or
+            mean_luminance
+            <= BLACK_BORDER_MEAN_LUMINANCE
+        )
+
+    def find_left_run(
+        ratios,
+        mean_luminances,
+        max_count
+    ):
         count = 0
 
         limit = min(
@@ -412,14 +447,20 @@ def _find_dark_border_crop(image):
         while (
             count < limit
             and
-            ratios[count]
-            >= BLACK_BORDER_DARK_RATIO
+            is_dark_edge(
+                ratios[count],
+                mean_luminances[count]
+            )
         ):
             count += 1
 
         return count
 
-    def find_right_run(ratios, max_count):
+    def find_right_run(
+        ratios,
+        mean_luminances,
+        max_count
+    ):
         count = 0
 
         limit = min(
@@ -430,10 +471,14 @@ def _find_dark_border_crop(image):
         while (
             count < limit
             and
-            ratios[
-                len(ratios) - 1 - count
-            ]
-            >= BLACK_BORDER_DARK_RATIO
+            is_dark_edge(
+                ratios[
+                    len(ratios) - 1 - count
+                ],
+                mean_luminances[
+                    len(mean_luminances) - 1 - count
+                ]
+            )
         ):
             count += 1
 
@@ -441,23 +486,42 @@ def _find_dark_border_crop(image):
 
     left = find_left_run(
         column_dark_ratio,
+        column_mean_luminance,
         max_left
     )
 
     right = find_right_run(
         column_dark_ratio,
+        column_mean_luminance,
         max_left
     )
 
     top = find_left_run(
         row_dark_ratio,
+        row_mean_luminance,
         max_top
     )
 
     bottom = find_right_run(
         row_dark_ratio,
+        row_mean_luminance,
         max_top
     )
+
+    # 如果上下/左右合计裁掉后只剩极薄区域，则放弃该方向裁剪。
+    if (
+        pw - left - right
+        < pw * MIN_REMAINING_RATIO
+    ):
+        left = 0
+        right = 0
+
+    if (
+        ph - top - bottom
+        < ph * MIN_REMAINING_RATIO
+    ):
+        top = 0
+        bottom = 0
 
     # 防止四边连续黑色时把整个图片裁空。
     if (
@@ -539,6 +603,12 @@ def _find_dark_border_crop(image):
                 0,
                 width,
                 height
+            ],
+            "detected_border_runs": [
+                0,
+                0,
+                0,
+                0
             ]
         }
 
@@ -589,6 +659,12 @@ def _find_dark_border_crop(image):
             crop_top,
             crop_right,
             crop_bottom
+        ],
+        "detected_border_runs": [
+            crop_left,
+            crop_top,
+            width - crop_right,
+            height - crop_bottom
         ]
     }
 
@@ -755,6 +831,9 @@ def preprocess_input_image(input_path):
         ],
         "crop_box": crop_info[
             "crop_box"
+        ],
+        "detected_border_runs": crop_info[
+            "detected_border_runs"
         ],
         "upscaled": resize_info[
             "upscaled"
@@ -3646,6 +3725,10 @@ def main():
         print(
             f"检测到黑边并自动裁剪："
             f"{preprocess_info['crop_box']}"
+        )
+        print(
+            f"黑边检测尺寸（左、上、右、下）："
+            f"{preprocess_info['detected_border_runs']}"
         )
     else:
         print(
