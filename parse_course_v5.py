@@ -14,6 +14,11 @@ from statistics import median
 
 import numpy as np
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from PIL import Image, ImageEnhance
 from paddleocr import PaddleOCR
 
@@ -97,6 +102,23 @@ OCR_LOW_CONTRAST_THRESHOLD = 65
 # 低对比度图片的轻度亮度对比增强倍率。
 # 建议先在 1.10~1.25 范围内调整。
 OCR_LOW_CONTRAST_FACTOR = 1.18
+
+# ============================================================
+# OCR 专用清洗
+# ============================================================
+
+# 自适应二值化窗口必须为奇数。
+OCR_ADAPTIVE_BLOCK_SIZE = 31
+
+# 自适应二值化常数。
+OCR_ADAPTIVE_C = 9
+
+# 网格线提取的最小长度（像素）。
+# 课程表网格线远长于单个汉字笔画。
+OCR_MIN_LINE_LENGTH = 30
+
+# OCR 调试输入文件名。
+OCR_INPUT_DEBUG_NAME = "ocr_input.png"
 
 
 # ============================================================
@@ -1167,6 +1189,175 @@ def _enhance_for_ocr(image):
     )
 
 
+def _build_ocr_input(image):
+    """
+    制作真正送给 PaddleOCR 的清洗版图片。
+
+    重点处理本项目这类课程表：
+    - 小字周围有压缩噪点/纸张纹理；
+    - 横竖网格线很多；
+    - 原图肉眼可看，但通用 OCR 检测器容易把网格和杂点当成干扰。
+
+    只生成一个 OCR 输入，不增加第二次 OCR。
+    """
+
+    # 没有 OpenCV 时，使用轻量 PIL 方案作为后备。
+    if cv2 is None:
+        gray = image.convert("L")
+
+        gray = ImageEnhance.Contrast(
+            gray
+        ).enhance(1.12)
+
+        return gray.convert("RGB"), {
+            "method":
+                "PIL灰度+轻度对比增强",
+            "opencv":
+                False,
+            "line_removal":
+                False,
+            "adaptive_threshold":
+                False
+        }
+
+    rgb = np.asarray(
+        image,
+        dtype=np.uint8
+    )
+
+    gray = cv2.cvtColor(
+        rgb,
+        cv2.COLOR_RGB2GRAY
+    )
+
+    # 先去掉最明显的孤立杂点。
+    denoised = cv2.medianBlur(
+        gray,
+        3
+    )
+
+    # 局部背景归一化：
+    # 消除纸张发灰、拍照光照不均带来的大尺度亮度变化。
+    background = cv2.GaussianBlur(
+        denoised,
+        (0, 0),
+        sigmaX=7
+    )
+
+    normalized = cv2.divide(
+        denoised,
+        background,
+        scale=255
+    )
+
+    # 先得到前景掩膜，用于提取长横线/竖线。
+    binary = cv2.adaptiveThreshold(
+        normalized,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        OCR_ADAPTIVE_BLOCK_SIZE,
+        OCR_ADAPTIVE_C
+    )
+
+    foreground = cv2.bitwise_not(
+        binary
+    )
+
+    height, width = foreground.shape
+
+    horizontal_length = max(
+        OCR_MIN_LINE_LENGTH,
+        int(width * 0.04)
+    )
+
+    vertical_length = max(
+        OCR_MIN_LINE_LENGTH,
+        int(height * 0.04)
+    )
+
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (
+            horizontal_length,
+            1
+        )
+    )
+
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (
+            1,
+            vertical_length
+        )
+    )
+
+    horizontal_lines = cv2.morphologyEx(
+        foreground,
+        cv2.MORPH_OPEN,
+        horizontal_kernel
+    )
+
+    vertical_lines = cv2.morphologyEx(
+        foreground,
+        cv2.MORPH_OPEN,
+        vertical_kernel
+    )
+
+    line_mask = cv2.bitwise_or(
+        horizontal_lines,
+        vertical_lines
+    )
+
+    # 轻微膨胀，覆盖灰色网格线边缘。
+    line_mask = cv2.dilate(
+        line_mask,
+        np.ones(
+            (2, 2),
+            dtype=np.uint8
+        ),
+        iterations=1
+    )
+
+    # 在灰度图上修补网格线，而不是简单涂成纯白。
+    cleaned = cv2.inpaint(
+        normalized,
+        line_mask,
+        2,
+        cv2.INPAINT_TELEA
+    )
+
+    # 去线后重新二值化。
+    cleaned_binary = cv2.adaptiveThreshold(
+        cleaned,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        OCR_ADAPTIVE_BLOCK_SIZE,
+        OCR_ADAPTIVE_C
+    )
+
+    return (
+        Image.fromarray(
+            cleaned_binary
+        ).convert("RGB"),
+        {
+            "method":
+                "OpenCV中值去噪+局部背景归一化+表格线去除+自适应二值化",
+            "opencv":
+                True,
+            "line_removal":
+                True,
+            "adaptive_threshold":
+                True,
+            "horizontal_kernel":
+                horizontal_length,
+            "vertical_kernel":
+                vertical_length
+        }
+    )
+
+
 def preprocess_input_image(input_path):
     """
     V5.3 主预处理：
@@ -1232,6 +1423,20 @@ def preprocess_input_image(input_path):
         output_path
     )
 
+    # OCR 真正使用的输入图，与人工检查的预处理图分开保存。
+    ocr_image, ocr_info = _build_ocr_input(
+        processed
+    )
+
+    ocr_input_path = os.path.join(
+        DEBUG_OUTPUT_DIR,
+        OCR_INPUT_DEBUG_NAME
+    )
+
+    ocr_image.save(
+        ocr_input_path
+    )
+
     return output_path, {
         "original_size": list(
             original_size
@@ -1279,6 +1484,24 @@ def preprocess_input_image(input_path):
             OCR_LOW_CONTRAST_THRESHOLD,
         "ocr_contrast_factor":
             enhance_info["factor"],
+        "ocr_input_path":
+            ocr_input_path,
+        "ocr_cleaning_method":
+            ocr_info["method"],
+        "ocr_opencv":
+            ocr_info["opencv"],
+        "ocr_line_removal":
+            ocr_info["line_removal"],
+        "ocr_adaptive_threshold":
+            ocr_info["adaptive_threshold"],
+        "ocr_horizontal_kernel":
+            ocr_info.get(
+                "horizontal_kernel"
+            ),
+        "ocr_vertical_kernel":
+            ocr_info.get(
+                "vertical_kernel"
+            ),
         "upscaled": resize_info[
             "upscaled"
         ],
@@ -4209,6 +4432,16 @@ def main():
             "对比度正常：不做额外 OCR 图像增强"
         )
 
+    print(
+        "OCR专用清洗："
+        f"{preprocess_info['ocr_cleaning_method']}"
+    )
+
+    print(
+        "OCR输入图片："
+        f"{preprocess_info['ocr_input_path']}"
+    )
+
 
     # --------------------------------------------------------
     # 加载 OCR 模型
@@ -4268,7 +4501,7 @@ def main():
 
     items, res = run_ocr(
         ocr,
-        preprocessed_path
+        preprocess_info["ocr_input_path"]
     )
 
     ocr_time = (
