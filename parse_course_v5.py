@@ -2199,8 +2199,147 @@ def detect_day_columns(items):
 
 
 # ============================================================
+# 课程名规范化
+# ============================================================
+
+COURSE_CANONICAL_ALIASES = {
+    "体育与健": "体育与健康",
+    "体有与健康": "体育与健康",
+    "体育与健一": "体育与健康",
+    "体育与健二": "体育与健康",
+    "道与法": "道德与法治",
+    "道法": "道德与法治",
+    "综合实践": "综合实践活动",
+}
+
+
+def canonicalize_course_text(text):
+    """
+    对 OCR 产生的明显截断/常见错字做保守修正。
+
+    不尝试凭空猜任意课程名称，只修正：
+    - 已知高置信度别名；
+    - 与常见课程名高度接近的短文本。
+    """
+
+    text = normalize_text(text)
+
+    text = re.sub(
+        r"^[，,；;。]+|[，,；;。]+$",
+        "",
+        text
+    )
+
+    compact = re.sub(
+        r"\s+",
+        "",
+        text
+    )
+
+    if not compact:
+        return ""
+
+    if compact in COURSE_CANONICAL_ALIASES:
+        return COURSE_CANONICAL_ALIASES[
+            compact
+        ]
+
+    if compact in COURSE_NAME_EXACT:
+        return compact
+
+    # 只对长度 >= 3 的中文文本进行模糊纠错，
+    # 避免把“语”“读”等单字噪声强行猜成课程。
+    if (
+        len(compact) < 3
+        or
+        not re.fullmatch(
+            r"[\u4e00-\u9fff·()（）0-9A-Za-z]+",
+            compact
+        )
+    ):
+        return text
+
+    # 去掉括号内容后再判断课程主体。
+    suffix = ""
+    base = compact
+
+    match = re.match(
+        r"^(.+?)([（(].*[）)])$",
+        compact
+    )
+
+    if match:
+        base = match.group(1)
+        suffix = compact[len(base):]
+
+    best = None
+
+    for course in COURSE_NAME_EXACT:
+
+        if len(course) < 3:
+            continue
+
+        # OCR 文本是课程名的前缀。
+        if (
+            base
+            != course
+            and
+            len(base) >= 3
+            and
+            course.startswith(base)
+        ):
+            ratio = len(base) / len(course)
+
+            if ratio >= 0.55:
+                candidate = (
+                    ratio,
+                    course
+                )
+
+                if (
+                    best is None
+                    or
+                    candidate[0]
+                    >
+                    best[0]
+                ):
+                    best = candidate
+
+        # OCR 文本按顺序保留了课程名主要汉字。
+        if len(base) >= 3:
+            pos = 0
+            for char in course:
+                if pos < len(base) and char == base[pos]:
+                    pos += 1
+
+            if pos == len(base):
+                ratio = len(base) / len(course)
+
+                if ratio >= 0.60:
+                    candidate = (
+                        ratio,
+                        course
+                    )
+
+                    if (
+                        best is None
+                        or
+                        candidate[0]
+                        >
+                        best[0]
+                    ):
+                        best = candidate
+
+    if best is not None:
+        return best[1] + suffix
+
+    return text
+
+
+# ============================================================
 # 从课程网格本身推断行
 # ============================================================
+
 
 def _detect_schedule_row_bands(
     items,
@@ -2208,8 +2347,13 @@ def _detect_schedule_row_bands(
     image_path
 ):
     """
-    从课程表真实的横向网格线识别行边界。
-    文字 OCR 只负责内容，课程“行”由表格几何决定。
+    从真实横向表格线识别课程行，并判断是否为“合并活动行”。
+
+    merged=True：
+        行内没有正常的星期列竖线，典型例子是“午休”。
+
+    standard row：
+        有星期列竖线，即使课程文字全部漏掉，也应保留这一行。
     """
 
     if (
@@ -2286,7 +2430,7 @@ def _detect_schedule_row_bands(
             )
         )
 
-        kernel = cv2.getStructuringElement(
+        horizontal_kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT,
             (
                 horizontal_length,
@@ -2297,7 +2441,7 @@ def _detect_schedule_row_bands(
         horizontal = cv2.morphologyEx(
             binary,
             cv2.MORPH_OPEN,
-            kernel
+            horizontal_kernel
         )
 
         coverage = (
@@ -2316,28 +2460,19 @@ def _detect_schedule_row_bands(
         groups = []
 
         for y in candidate_rows:
+            y = int(y)
+
             if not groups:
-                groups.append([int(y)])
+                groups.append([y])
                 continue
 
-            if (
-                y
-                -
-                groups[-1][-1]
-                <= 3
-            ):
-                groups[-1].append(
-                    int(y)
-                )
+            if y - groups[-1][-1] <= 3:
+                groups[-1].append(y)
             else:
-                groups.append(
-                    [int(y)]
-                )
+                groups.append([y])
 
         lines = [
-            float(
-                median(group)
-            )
+            float(median(group))
             for group in groups
         ]
 
@@ -2356,6 +2491,7 @@ def _detect_schedule_row_bands(
         if len(lines) < 2:
             return []
 
+        # 表格横线的相邻距离。
         line_gaps = [
             lines[i] - lines[i - 1]
             for i in range(
@@ -2372,11 +2508,50 @@ def _detect_schedule_row_bands(
             line_gaps
         )
 
+        # 计算真实竖线覆盖率，用于识别合并行。
+        vertical_kernel_height = max(
+            12,
+            int(
+                typical_row_height * 0.55
+            )
+        )
+
+        vertical_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (
+                1,
+                vertical_kernel_height
+            )
+        )
+
+        vertical = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_OPEN,
+            vertical_kernel
+        )
+
+        expected_boundaries = [
+            int(
+                round(
+                    centers[i]
+                    -
+                    grid_left
+                    -
+                    typical_gap / 2
+                )
+            )
+            for i in range(
+                1,
+                len(centers)
+            )
+        ]
+
         bands = []
 
         for i in range(
             len(lines) - 1
         ):
+
             top = lines[i]
             bottom = lines[i + 1]
             row_height = bottom - top
@@ -2389,12 +2564,56 @@ def _detect_schedule_row_bands(
             ):
                 continue
 
+            # 在当前 band 中检查 4 条星期列分隔线是否存在。
+            internal_vertical_count = 0
+
+            for boundary_x in expected_boundaries:
+                y1 = max(
+                    0,
+                    int(round(top + 3))
+                )
+
+                y2 = min(
+                    height,
+                    int(round(bottom - 3))
+                )
+
+                if y2 <= y1:
+                    continue
+
+                x1 = max(
+                    0,
+                    boundary_x - 2
+                )
+
+                x2 = min(
+                    roi.shape[1],
+                    boundary_x + 3
+                )
+
+                if x2 <= x1:
+                    continue
+
+                score = float(
+                    vertical[
+                        y1:y2,
+                        x1:x2
+                    ].mean()
+                    /
+                    255.0
+                )
+
+                if score >= 0.12:
+                    internal_vertical_count += 1
+
             bands.append({
                 "top": top,
                 "bottom": bottom,
-                "cy": (
-                    top + bottom
-                ) / 2
+                "cy": (top + bottom) / 2,
+                "internal_vertical_count":
+                    internal_vertical_count,
+                "merged":
+                    internal_vertical_count < 2
             })
 
         return bands
@@ -2409,7 +2628,14 @@ def infer_periods_from_grid(
     image_path=None
 ):
     """
-    首选表格横线确定课程行；没有可靠横线时才退回 OCR Y 聚类。
+    首选真实表格行边界。
+
+    过滤规则：
+    1. 标准课程行：保留，即使当前 OCR 没识别出文字；
+    2. 合并行：
+       - 午休/晨诵等非课程活动 → 删除；
+       - 后续如果出现合并型课程安排，则保留；
+    3. 完全依赖课程网格，不依赖左侧第几节标签。
     """
 
     if not day_columns:
@@ -2430,10 +2656,6 @@ def infer_periods_from_grid(
     grid_left = boundaries[0]
     grid_right = boundaries[-1]
 
-    # --------------------------------------------------------
-    # 方案 A：根据真实横向表格线确定行
-    # --------------------------------------------------------
-
     bands = _detect_schedule_row_bands(
         items,
         day_columns,
@@ -2450,36 +2672,91 @@ def infer_periods_from_grid(
                 item
                 for item in items
                 if (
-                    band["top"] - 3
+                    band["top"] - 4
                     <= item["cy"]
-                    <= band["bottom"] + 3
+                    <= band["bottom"] + 4
                     and
-                    item["cx"]
-                    >= grid_left
+                    item["cx"] >= grid_left
                     and
-                    item["cx"]
-                    < grid_right
+                    item["cx"] < grid_right
                 )
             ]
 
-            meaningful = [
+            # 合并 OCR 小片段，例如“午”“休”，组合后再判断活动名称。
+            compact_text = "".join(
+                re.sub(
+                    r"\s+",
+                    "",
+                    normalize_text(
+                        item.get(
+                            "text",
+                            ""
+                        )
+                    )
+                )
+                for item
+                in sorted(
+                    band_items,
+                    key=lambda x: (
+                        x["cy"],
+                        x["cx"]
+                    )
+                )
+            )
+
+            explicit_activity = (
+                is_obvious_non_course(
+                    compact_text
+                )
+            )
+
+            non_name_items = [
                 item
                 for item in band_items
-                if not is_obvious_non_course(
+                if (
                     item.get(
                         "text",
                         ""
                     )
+                    and
+                    not is_obvious_non_course(
+                        item.get(
+                            "text",
+                            ""
+                        )
+                    )
+                    and
+                    not is_name_like(
+                        item.get(
+                            "text",
+                            ""
+                        )
+                    )
                 )
             ]
 
-            # 只包含“晨诵/午休”等活动的横线行直接跳过。
-            if not meaningful:
+            # 标准行中如果出现活动词，但没有真正课程文字，
+            # 例如“晨诵”，整行直接排除。
+            if (
+                explicit_activity
+                and
+                not non_name_items
+            ):
+                continue
+
+            # 合并行若仅是“午休”等活动，排除。
+            if (
+                band["merged"]
+                and
+                explicit_activity
+                and
+                not non_name_items
+            ):
                 continue
 
             number = len(periods) + 1
 
-            periods.append({
+            period = {
                 "number":
                     number,
 
@@ -2498,25 +2775,33 @@ def infer_periods_from_grid(
                 "cx":
                     median(
                         item["cx"]
-                        for item in meaningful
-                    ),
+                        for item
+                        in band_items
+                    )
+                    if band_items
+                    else median(columns),
 
                 "cy":
                     band["cy"],
 
                 "score":
-                    min(
-                        float(
-                            item["score"]
+                    (
+                        min(
+                            float(
+                                item["score"]
+                            )
+                            for item
+                            in band_items
                         )
-                        for item in meaningful
+                        if band_items
+                        else 1.0
                     ),
 
                 "source":
                     "表格横线行推断",
 
                 "item_count":
-                    len(meaningful),
+                    len(band_items),
 
                 "row_top":
                     band["top"],
@@ -2524,18 +2809,19 @@ def infer_periods_from_grid(
                 "row_bottom":
                     band["bottom"],
 
-                "row_height":
-                    band["bottom"]
-                    - band["top"]
-            })
+                "merged":
+                    band["merged"],
+
+                "internal_vertical_count":
+                    band["internal_vertical_count"]
+            }
+
+            periods.append(period)
 
         if len(periods) >= 2:
             return periods
 
-    # --------------------------------------------------------
-    # 方案 B：没有可靠表格线时，退回 OCR Y 聚类
-    # --------------------------------------------------------
-
+    # 没有可靠表格线时继续使用旧方案。
     candidates = []
 
     for item in items:
@@ -2586,9 +2872,7 @@ def infer_periods_from_grid(
         ):
             continue
 
-        candidates.append(
-            item
-        )
+        candidates.append(item)
 
     if not candidates:
         return []
@@ -2596,9 +2880,7 @@ def infer_periods_from_grid(
     heights = [
         max(
             1,
-            item["box"][3]
-            -
-            item["box"][1]
+            item["box"][3] - item["box"][1]
         )
         for item in candidates
     ]
@@ -2618,50 +2900,30 @@ def infer_periods_from_grid(
 
     return [
         {
-            "number":
-                index,
-
-            "label":
-                f"第{index}节",
-
-            "raw_label":
-                None,
-
-            "start":
-                index,
-
-            "end":
-                index,
-
-            "cx":
-                median(
-                    item["cx"]
-                    for item
-                    in group
-                ),
-
-            "cy":
-                median(
-                    item["cy"]
-                    for item
-                    in group
-                ),
-
-            "score":
-                min(
-                    float(
-                        item["score"]
-                    )
-                    for item
-                    in group
-                ),
-
+            "number": index,
+            "label": f"第{index}节",
+            "raw_label": None,
+            "start": index,
+            "end": index,
+            "cx": median(
+                item["cx"]
+                for item
+                in group
+            ),
+            "cy": median(
+                item["cy"]
+                for item
+                in group
+            ),
+            "score": min(
+                float(item["score"])
+                for item
+                in group
+            ),
             "source":
                 "课程网格OCR行推断",
-
             "item_count":
                 len(group),
-
             "row_tolerance":
                 row_tolerance
         }
@@ -2671,9 +2933,6 @@ def infer_periods_from_grid(
             start=1
         )
     ]
-
-
-
 
 # ============================================================
 # 自动检测节次
@@ -2939,7 +3198,16 @@ def assign_period(
     threshold
 ):
 
-    # 有真实网格行边界时，直接判断文字中心落在哪一行。
+    # 有真实表格行边界时，只允许文字进入其所在的真实课程行。
+    # 不再使用“最近行”把午休/备注等文字吸附到附近课程行。
+    row_bounded = any(
+        "row_top" in period
+        and
+        "row_bottom" in period
+        for period
+        in periods
+    )
+
     for period in periods:
 
         if (
@@ -2956,7 +3224,13 @@ def assign_period(
                 0.0
             )
 
-    # 无表格行边界时，使用旧的最近中心兜底。
+    if row_bounded:
+        return (
+            None,
+            float("inf")
+        )
+
+    # 无真实行边界时，使用旧的最近中心兜底。
     nearest = min(
         periods,
         key=lambda p:
@@ -2981,7 +3255,6 @@ def assign_period(
         nearest,
         distance
     )
-
 
 # ============================================================
 # 星期边界
@@ -3263,12 +3536,21 @@ COMMON_SURNAMES = set(
 
 # 明确是课程/课程组成部分的短文本。
 COURSE_NAME_EXACT = {
-    "语文", "数学", "英语", "外语", "科学", "体育", "音乐",
-    "美术", "艺术", "书法", "劳动", "信息科技", "信息技术",
-    "道德与法治", "品德与社会", "综合实践", "综合实践活动",
-    "心理健康", "班队", "体活", "校本课程", "校本课", "班队会", "班队课",
-    "班会", "体育与健康", "唱游", "造型", "阅读", "写字",
-    "地方课程", "传统文化", "国学", "计算机", "技术",
+    "语文", "数学", "英语", "外语", "日语", "俄语", "科学", "自然",
+    "物理", "化学", "生物", "生物学", "生命科学", "地理", "历史", "历史与社会",
+    "体育", "体育与健康", "体活", "体育活动", "健康教育", "音乐", "美术", "艺术",
+    "舞蹈", "戏剧", "影视", "唱游", "造型", "手工", "美工", "音乐欣赏", "美术欣赏",
+    "书法", "写字", "硬笔书法", "软笔书法", "阅读", "习作", "作文", "阅读与写作",
+    "劳动", "劳动技术", "劳技", "劳动与技术", "通用技术", "信息技术", "信息科技",
+    "计算机", "微机", "电脑", "技术",
+    "道德与法治", "道法", "道与法", "品德与生活", "品德与社会", "思想品德",
+    "思品", "思想政治", "思政",
+    "综合实践", "综合实践活动", "研究性学习", "社会实践", "研学实践",
+    "心理健康", "心理健康教育", "心理辅导", "心理",
+    "安全教育", "国防教育", "环境教育", "生态文明教育", "生涯规划",
+    "班队", "班队会", "班队课", "班会", "班与队", "队会", "少先队活动",
+    "少先队活动课", "主题班会", "德育", "德育课",
+    "校本课程", "校本课", "地方课程", "传统文化", "国学", "地方文化", "乡土课程",
 }
 
 
@@ -3666,6 +3948,13 @@ def join_cell_items(
         text = remove_teacher_names(
             text,
             teacher_names
+        )
+
+        if not text:
+            continue
+
+        text = canonicalize_course_text(
+            text
         )
 
         if not text:
