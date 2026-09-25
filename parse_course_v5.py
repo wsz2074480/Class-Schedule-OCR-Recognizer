@@ -141,6 +141,7 @@ NON_COURSE_EXACT = {
     "中午",
     "早读",
     "晨读",
+    "晨诵",
 }
 
 
@@ -2192,6 +2193,212 @@ def detect_day_columns(items):
 
 
 # ============================================================
+# 从课程网格本身推断行
+# ============================================================
+
+def infer_periods_from_grid(
+    items,
+    day_columns
+):
+    """
+    不依赖左侧“第几节/上午几/下午几”标签，
+    直接根据五个星期列里的 OCR 文字垂直分布推断课程行。
+
+    这是当前课程表解析的主方案。
+
+    优点：
+    - 左侧节次标签缺失、被遮挡、写法特殊，都不影响；
+    - “下午1、下午2、课后服务及课外活动一、二”这类混合行
+      仍然可以连续建立为第5~8节；
+    - 行号只用于标准化输出，不把某个学校的原始标签格式
+      当成课程表结构的必要条件。
+    """
+
+    if not day_columns:
+        return []
+
+    columns, boundaries, cell_width = (
+        calculate_day_boundaries(
+            day_columns
+        )
+    )
+
+    header_y = median(
+        day["cy"]
+        for day
+        in day_columns
+        if day.get("cy") is not None
+    )
+
+    grid_left = boundaries[0]
+    grid_right = boundaries[-1]
+
+    candidates = []
+
+    for item in items:
+
+        text = normalize_text(
+            item.get(
+                "text",
+                ""
+            )
+        )
+
+        if not text:
+            continue
+
+        # 星期表头及明显的标题区域。
+        if item["cy"] <= header_y + 20:
+            continue
+
+        if parse_explicit_weekday(
+            text
+        ) is not None:
+            continue
+
+        if re.fullmatch(
+            r"[1-7]",
+            text
+        ):
+            continue
+
+        # 左侧节次标签不参与行推断。
+        if item["cx"] < grid_left:
+            continue
+
+        if item["cx"] >= grid_right:
+            continue
+
+        if parse_period(
+            text
+        ) is not None:
+            continue
+
+        # 备注、晨诵、午休等明显不是课程行的内容。
+        if is_obvious_non_course(
+            text
+        ):
+            continue
+
+        bbox_width = max(
+            1,
+            item["box"][2]
+            -
+            item["box"][0]
+        )
+
+        # 排除横跨整个课程表的页脚/备注。
+        # 普通单元格文字即使很长，也不会横跨近两列。
+        if bbox_width > (
+            cell_width * 1.8
+        ):
+            continue
+
+        # 确保文字确实落在星期课程网格中。
+        if not assign_days(
+            item,
+            day_columns
+        ):
+            continue
+
+        candidates.append(
+            item
+        )
+
+    if not candidates:
+        return []
+
+    # 根据 OCR 文字高度动态设置“同一行”的 Y 容差。
+    heights = [
+        max(
+            1,
+            item["box"][3]
+            -
+            item["box"][1]
+        )
+        for item
+        in candidates
+    ]
+
+    row_tolerance = median(
+        heights
+    ) * 1.15
+
+    row_tolerance = max(
+        16,
+        min(
+            ROW_CLUSTER_MAX_DISTANCE,
+            row_tolerance
+        )
+    )
+
+    groups = cluster_by_y(
+        candidates,
+        tolerance=row_tolerance
+    )
+
+    periods = []
+
+    for index, group in enumerate(
+        groups,
+        start=1
+    ):
+
+        if not group:
+            continue
+
+        center_y = median(
+            item["cy"]
+            for item in group
+        )
+
+        periods.append({
+            "number":
+                index,
+
+            "label":
+                f"第{index}节",
+
+            "raw_label":
+                None,
+
+            "start":
+                index,
+
+            "end":
+                index,
+
+            "cx":
+                median(
+                    item["cx"]
+                    for item in group
+                ),
+
+            "cy":
+                center_y,
+
+            "score":
+                min(
+                    float(
+                        item["score"]
+                    )
+                    for item in group
+                ),
+
+            "source":
+                "课程网格行推断",
+
+            "item_count":
+                len(group),
+
+            "row_tolerance":
+                row_tolerance
+        })
+
+    return periods
+
+
+# ============================================================
 # 自动检测节次
 # ============================================================
 
@@ -2199,9 +2406,31 @@ def detect_periods(
     items,
     day_columns
 ):
+    """
+    节次检测。
 
-    if not day_columns:
-        return []
+    主方案：
+        直接从课程网格中的 OCR 文字按 Y 聚类得到课程行。
+
+    备用方案：
+        如果课程网格文字不足，再尝试识别左侧节次标签。
+    """
+
+    # --------------------------------------------------------
+    # 主方案：从课程网格本身推断行
+    # --------------------------------------------------------
+
+    periods = infer_periods_from_grid(
+        items,
+        day_columns
+    )
+
+    if periods:
+        return periods
+
+    # --------------------------------------------------------
+    # 备用方案：左侧节次标签
+    # --------------------------------------------------------
 
     day_centers = sorted(
         x["cx"]
@@ -2212,7 +2441,8 @@ def detect_periods(
 
         gaps = [
             day_centers[i]
-            - day_centers[i - 1]
+            -
+            day_centers[i - 1]
             for i in range(
                 1,
                 len(day_centers)
@@ -2227,29 +2457,22 @@ def detect_periods(
 
         column_gap = 180
 
-
-    # 左侧节次区域
     grid_left = (
         day_centers[0]
         - column_gap
         * 0.72
     )
 
-
     max_y = max(
         item["cy"]
         for item in items
     )
 
-
     candidates = []
 
     for item in items:
 
-        if (
-            item["cx"]
-            >= grid_left
-        ):
+        if item["cx"] >= grid_left:
             continue
 
         if item["cy"] < max_y * 0.15:
@@ -2267,17 +2490,13 @@ def detect_periods(
             **parsed
         })
 
-
     if not candidates:
         return []
 
-
-    # 同一节次附近重复OCR，只留一个
     groups = cluster_by_y(
         candidates,
         tolerance=28
     )
-
 
     anchors = []
 
@@ -2293,39 +2512,16 @@ def detect_periods(
             best
         )
 
-
     anchors.sort(
         key=lambda x:
         x["cy"]
     )
 
-
-    if not anchors:
-        return []
-
-
-    # 判断是不是：
-    #
-    # 1 2 3 4 5 6 7
-    #
-    # 如果是，则直接使用编号。
-    #
-    # 如果是：
-    #
-    # 1 2 3 4 1 2 3 4
-    #
-    # 则转换为：
-    #
-    # 1 2 3 4 5 6 7 8
     starts = [
         x["start"]
         for x in anchors
     ]
 
-
-    # 只有原始编号完全连续递增时才直接采用。
-    # 上午1、上午2、下午1、下午2 的原始编号是 1、2、1、2，
-    # 必须根据垂直顺序重新编号。
     use_raw_number = (
         len(set(starts))
         == len(starts)
@@ -2342,7 +2538,6 @@ def detect_periods(
         )
     )
 
-
     periods = []
 
     next_number = 1
@@ -2356,20 +2551,14 @@ def detect_periods(
             + 1
         )
 
-
         if use_raw_number:
-
             number = anchor[
                 "start"
             ]
-
         else:
-
             number = next_number
 
-
         periods.append({
-
             "number":
                 number,
 
@@ -2378,6 +2567,11 @@ def detect_periods(
 
             "raw_label":
                 anchor["label"],
+
+            "session":
+                anchor.get(
+                    "session"
+                ),
 
             "start":
                 anchor["start"],
@@ -2392,18 +2586,21 @@ def detect_periods(
                 anchor["cy"],
 
             "score":
-                anchor["score"]
-        })
+                anchor["score"],
 
+            "source":
+                "左侧节次标签",
+
+            "item_count":
+                1
+        })
 
         next_number = (
             number
             + span
         )
 
-
     return periods
-
 
 # ============================================================
 # 节次匹配距离
@@ -3358,6 +3555,10 @@ def parse_orientation(
     # --------------------------------------------------------
     # 节次
     # --------------------------------------------------------
+    #
+    # 现在不再把左侧节次标签作为必要条件。
+    # 优先从五个星期列里的课程文字 Y 坐标直接建立课程行。
+    #
 
     periods = detect_periods(
         items,
