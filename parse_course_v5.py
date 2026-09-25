@@ -274,6 +274,33 @@ def parse_period(text):
 
     text = normalize_text(text)
 
+    # 课程表常见写法：
+    # 上午1 / 上午一 / 上1
+    # 下午1 / 下午一 / 下1
+    # 保留原始 1~4 编号，后续由 detect_periods() 按整张表的垂直顺序重新编号。
+    session_match = re.match(
+        r"^(上午|下午|上|下)\s*"
+        r"([0-9]{1,2}|[一二三四五六七八九十]+)$",
+        text
+    )
+
+    if session_match:
+        start = chinese_number_to_int(
+            session_match.group(2)
+        )
+
+        if (
+            start is not None
+            and
+            1 <= start <= 12
+        ):
+            return {
+                "start": start,
+                "end": start,
+                "label": text,
+                "session": session_match.group(1)
+            }
+
     pattern = re.compile(
         r"^"
         r"(?:第\s*)?"
@@ -321,7 +348,8 @@ def parse_period(text):
             f"{start}-{end}"
             if start != end
             else str(start)
-        )
+        ),
+        "session": None
     }
 
 
@@ -2295,13 +2323,17 @@ def detect_periods(
     ]
 
 
+    # 只有原始编号完全连续递增时才直接采用。
+    # 上午1、上午2、下午1、下午2 的原始编号是 1、2、1、2，
+    # 必须根据垂直顺序重新编号。
     use_raw_number = (
         len(set(starts))
         == len(starts)
         and
         all(
             starts[i]
-            > starts[i - 1]
+            ==
+            starts[i - 1] + 1
             for i
             in range(
                 1,
