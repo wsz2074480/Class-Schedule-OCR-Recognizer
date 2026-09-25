@@ -1423,7 +1423,8 @@ def preprocess_input_image(input_path):
         output_path
     )
 
-    # OCR 真正使用的输入图，与人工检查的预处理图分开保存。
+    # 额外生成一张“清洗版”供对比观察。
+    # 注意：该版本可能过度处理小字，因此暂不直接作为 PaddleOCR 输入。
     ocr_image, ocr_info = _build_ocr_input(
         processed
     )
@@ -1486,6 +1487,8 @@ def preprocess_input_image(input_path):
             enhance_info["factor"],
         "ocr_input_path":
             ocr_input_path,
+        "ocr_actual_input_path":
+            output_path,
         "ocr_cleaning_method":
             ocr_info["method"],
         "ocr_opencv":
@@ -4438,8 +4441,13 @@ def main():
     )
 
     print(
-        "OCR输入图片："
+        "OCR对比清洗图："
         f"{preprocess_info['ocr_input_path']}"
+    )
+
+    print(
+        "PaddleOCR实际输入："
+        f"{preprocess_info['ocr_actual_input_path']}"
     )
 
 
@@ -4499,9 +4507,12 @@ def main():
         time.perf_counter()
     )
 
+    # 经过本次 DZ048 实测：
+    # 二值化/去线版本会把网格和小字一起“切碎”。
+    # 因此 PaddleOCR 恢复使用裁边+放大后的自然图像。
     items, res = run_ocr(
         ocr,
-        preprocess_info["ocr_input_path"]
+        preprocess_info["ocr_actual_input_path"]
     )
 
     ocr_time = (
