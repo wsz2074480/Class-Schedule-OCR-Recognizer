@@ -2225,11 +2225,13 @@ COURSE_CANONICAL_ALIASES = {
 
 def canonicalize_course_text(text):
     """
-    对 OCR 产生的明显截断/常见错字做保守修正。
+    对 OCR 产生的常见截断/错字做保守修正。
 
-    不尝试凭空猜任意课程名称，只修正：
-    - 已知高置信度别名；
-    - 与常见课程名高度接近的短文本。
+    重点：
+    - 先拆出课程主体与括号备注；
+    - 对主体应用别名修正；
+    - 再恢复括号内容；
+    - 最后才做保守的前缀/子序列匹配。
     """
 
     text = normalize_text(text)
@@ -2249,27 +2251,6 @@ def canonicalize_course_text(text):
     if not compact:
         return ""
 
-    if compact in COURSE_CANONICAL_ALIASES:
-        return COURSE_CANONICAL_ALIASES[
-            compact
-        ]
-
-    if compact in COURSE_NAME_EXACT:
-        return compact
-
-    # 只对长度 >= 3 的中文文本进行模糊纠错，
-    # 避免把“语”“读”等单字噪声强行猜成课程。
-    if (
-        len(compact) < 3
-        or
-        not re.fullmatch(
-            r"[\u4e00-\u9fff·()（）0-9A-Za-z]+",
-            compact
-        )
-    ):
-        return text
-
-    # 去掉括号内容后再判断课程主体。
     suffix = ""
     base = compact
 
@@ -2280,7 +2261,31 @@ def canonicalize_course_text(text):
 
     if match:
         base = match.group(1)
-        suffix = compact[len(base):]
+        suffix = match.group(2)
+
+    # 先处理已知 OCR 错别字/截断。
+    if base in COURSE_CANONICAL_ALIASES:
+        return (
+            COURSE_CANONICAL_ALIASES[
+                base
+            ]
+            +
+            suffix
+        )
+
+    if base in COURSE_NAME_EXACT:
+        return base + suffix
+
+    # 只对长度 >= 3 的中文课程主体进行保守模糊匹配。
+    if (
+        len(base) < 3
+        or
+        not re.fullmatch(
+            r"[\u4e00-\u9fff·]+",
+            base
+        )
+    ):
+        return text
 
     best = None
 
@@ -2289,16 +2294,13 @@ def canonicalize_course_text(text):
         if len(course) < 3:
             continue
 
-        # OCR 文本是课程名的前缀。
-        if (
-            base
-            != course
-            and
-            len(base) >= 3
-            and
-            course.startswith(base)
-        ):
-            ratio = len(base) / len(course)
+        # OCR 主体是课程名前缀。
+        if course.startswith(base):
+            ratio = (
+                len(base)
+                /
+                len(course)
+            )
 
             if ratio >= 0.55:
                 candidate = (
@@ -2309,41 +2311,47 @@ def canonicalize_course_text(text):
                 if (
                     best is None
                     or
-                    candidate[0]
-                    >
-                    best[0]
+                    candidate[0] > best[0]
                 ):
                     best = candidate
 
-        # OCR 文本按顺序保留了课程名主要汉字。
-        if len(base) >= 3:
-            pos = 0
-            for char in course:
-                if pos < len(base) and char == base[pos]:
-                    pos += 1
+        # OCR 主体按顺序保留了课程名的主要汉字。
+        pos = 0
 
-            if pos == len(base):
-                ratio = len(base) / len(course)
+        for char in course:
+            if (
+                pos < len(base)
+                and
+                char == base[pos]
+            ):
+                pos += 1
 
-                if ratio >= 0.60:
-                    candidate = (
-                        ratio,
-                        course
-                    )
+        if pos == len(base):
+            ratio = (
+                len(base)
+                /
+                len(course)
+            )
 
-                    if (
-                        best is None
-                        or
-                        candidate[0]
-                        >
-                        best[0]
-                    ):
-                        best = candidate
+            if ratio >= 0.60:
+                candidate = (
+                    ratio,
+                    course
+                )
+
+                if (
+                    best is None
+                    or
+                    candidate[0] > best[0]
+                ):
+                    best = candidate
 
     if best is not None:
         return best[1] + suffix
 
     return text
+
+
 
 
 # ============================================================
