@@ -50,10 +50,10 @@ LOCAL_OCR_MAX_CELLS = 12
 LOCAL_OCR_EMPTY_ROW_MIN_FILLED = 2
 
 # 空单元格接受局部 OCR 的最低平均置信度。
-LOCAL_OCR_EMPTY_MIN_CONFIDENCE = 0.70
+LOCAL_OCR_EMPTY_MIN_CONFIDENCE = 0.78
 
 # 非空但可疑单元格接受局部 OCR 的最低平均置信度。
-LOCAL_OCR_REPAIR_MIN_CONFIDENCE = 0.65
+LOCAL_OCR_REPAIR_MIN_CONFIDENCE = 0.72
 
 # 文本短于等于该长度时，认为有较高概率存在截断。
 LOCAL_OCR_SHORT_TEXT_LENGTH = 2
@@ -3797,10 +3797,14 @@ def extract_edge_name_candidates(text):
 
 def infer_teacher_names(items):
     """
-    根据版面证据推断教师姓名。
+    基于单元格版面证据推断教师姓名。
 
-    课程默认保留。只有同时获得足够版面/重复证据的短中文文本，
-    才进入教师过滤集合。
+    设计原则：
+    - 任何未知文本默认视为课程；
+    - 姓氏表只提供弱证据；
+    - 单独姓名必须同时具备“下置”以及重复/字号等第二证据；
+    - 粘连姓名优先依赖尾部位置；
+    - 已知课程词不会因为名字特征被删除。
     """
 
     if not items:
@@ -3827,6 +3831,8 @@ def infer_teacher_names(items):
 
     evidence = {}
     occurrences = {}
+    layout_support = {}
+    suffix_support = {}
 
     def add_evidence(
         name,
@@ -3870,9 +3876,7 @@ def infer_teacher_names(items):
             )
         )
 
-        for index, item in enumerate(
-            ordered
-        ):
+        for item in ordered:
 
             compact = re.sub(
                 r"\s+",
@@ -3897,7 +3901,13 @@ def infer_teacher_names(items):
             ):
                 continue
 
-            # 必须有其它文字位于当前候选上方。
+            item_height = max(
+                1,
+                item["box"][3]
+                -
+                item["box"][1]
+            )
+
             above = [
                 other
                 for other in ordered
@@ -3909,50 +3919,69 @@ def infer_teacher_names(items):
                 -
                 max(
                     6,
-                    (
-                        item["box"][3]
-                        -
-                        item["box"][1]
-                    )
-                    * 0.35
+                    item_height * 0.35
                 )
             ]
 
             if not above:
                 continue
 
-            score = 3
+            min_y = min(
+                other["cy"]
+                for other
+                in ordered
+            )
 
-            # 常见姓氏只作为弱证据。
-            if compact[0] in COMMON_SURNAMES:
-                score += 1
-
-            # 候选明显位于该格下部，再加一点证据。
             max_y = max(
                 other["cy"]
                 for other
                 in ordered
             )
 
-            if item["cy"] >= (
-                min(
-                    other["cy"]
-                    for other
-                    in ordered
-                )
+            lower_position = (
+                item["cy"]
+                >=
+                min_y
                 +
-                (
-                    max_y
+                (max_y - min_y) * 0.55
+            )
+
+            upper_heights = [
+                max(
+                    1,
+                    other["box"][3]
                     -
-                    min(
-                        other["cy"]
-                        for other
-                        in ordered
-                    )
+                    other["box"][1]
                 )
-                * 0.55
-            ):
+                for other
+                in above
+            ]
+
+            smaller_than_course = any(
+                item_height
+                <=
+                height * 0.90
+                for height
+                in upper_heights
+            )
+
+            score = 3
+
+            if compact[0] in COMMON_SURNAMES:
                 score += 1
+
+            if lower_position:
+                score += 1
+
+            if smaller_than_course:
+                score += 2
+                layout_support.setdefault(
+                    compact,
+                    False
+                )
+                layout_support[
+                    compact
+                ] = True
 
             add_evidence(
                 compact,
@@ -3964,7 +3993,7 @@ def infer_teacher_names(items):
                 set()
             ).add(key)
 
-    # 同一个候选在多个不同课程格重复出现，是强证据。
+    # 跨多个独立课程格重复出现，是强证据。
     for name, cells in occurrences.items():
         if len(cells) >= 2:
             add_evidence(
@@ -3975,7 +4004,9 @@ def infer_teacher_names(items):
                 )
             )
 
-    # 粘连形式：课程+教师的尾部姓名。
+    # 粘连文本：
+    #   语文张老师 / 语文张润凝
+    #   张润凝语文（前缀仅作为弱证据）
     for item in items:
 
         compact = re.sub(
@@ -4005,18 +4036,63 @@ def infer_teacher_names(items):
                     2
                 )
 
+                suffix_support[
+                    name
+                ] = True
+
                 if name[0] in COMMON_SURNAMES:
                     add_evidence(
                         name,
                         1
                     )
 
-    return {
-        name
-        for name, score
-        in evidence.items()
-        if score >= 4
-    }
+            elif position == "prefix":
+                # 前缀形式可能与真实课程词混淆，只保留弱证据；
+                # 最终必须还有重复或其它版面证据。
+                add_evidence(
+                    name,
+                    1
+                )
+
+    teacher_names = set()
+
+    for name, score in evidence.items():
+
+        if score < 4:
+            continue
+
+        repeated = (
+            len(
+                occurrences.get(
+                    name,
+                    set()
+                )
+            )
+            >= 2
+        )
+
+        # 必须至少具备：
+        # 1) 多个课程格重复；
+        # 2) 单元格字号/位置等额外版面证据；
+        # 3) 粘连文本尾部姓名证据。
+        if (
+            repeated
+            or
+            layout_support.get(
+                name,
+                False
+            )
+            or
+            suffix_support.get(
+                name,
+                False
+            )
+        ):
+            teacher_names.add(
+                name
+            )
+
+    return teacher_names
 
 
 def remove_teacher_names(
@@ -4917,21 +4993,30 @@ def refine_suspicious_cells(
                 )
             )
 
-            accept = (
-                local_len >= current_len
+            # 对普通文本，只有明确变长才替换。
+            # 对已知 OCR 别名，只有局部 OCR 结果置信度更高时才替换。
+            canonical_improved = (
+                local_canonical
+                !=
+                current_canonical
                 and
                 local_score
-                >= current_score - 0.05
-                and
+                >=
+                current_score + 0.03
+            )
+
+            accept = (
                 (
-                    local_text
-                    !=
-                    current_text
-                    or
-                    local_canonical
-                    !=
-                    current_canonical
+                    local_len
+                    >
+                    current_len
+                    and
+                    local_score
+                    >=
+                    current_score - 0.05
                 )
+                or
+                canonical_improved
             )
 
         if not accept:
