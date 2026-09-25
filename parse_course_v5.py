@@ -6482,6 +6482,23 @@ def main():
         f"{parsed.get('structure_score', 0):.2f}"
     )
 
+    local_ocr_stats = parsed.get(
+        "local_ocr",
+        {}
+    )
+
+    if local_ocr_stats.get(
+        "attempted",
+        0
+    ):
+        print(
+            "局部补识别："
+            f"候选 {local_ocr_stats.get('candidates', 0)}，"
+            f"尝试 {local_ocr_stats.get('attempted', 0)}，"
+            f"成功 {local_ocr_stats.get('accepted', 0)}，"
+            f"耗时 {local_ocr_stats.get('time_seconds', 0):.2f} 秒"
+        )
+
     total_time = (
         time.perf_counter()
         - start_total
