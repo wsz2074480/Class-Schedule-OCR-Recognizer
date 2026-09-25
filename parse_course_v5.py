@@ -39,6 +39,29 @@ DEBUG_OUTPUT_DIR = "debug_output"
 
 LOW_CONFIDENCE_THRESHOLD = 0.90
 
+# ------------------------------------------------------------
+# 局部单元格补识别
+# ------------------------------------------------------------
+
+# 每张课表最多做多少个局部单元格补识别，避免速度失控。
+LOCAL_OCR_MAX_CELLS = 12
+
+# 空单元格只有在所在行已有足够课程内容时，才进入候选。
+LOCAL_OCR_EMPTY_ROW_MIN_FILLED = 2
+
+# 空单元格接受局部 OCR 的最低平均置信度。
+LOCAL_OCR_EMPTY_MIN_CONFIDENCE = 0.70
+
+# 非空但可疑单元格接受局部 OCR 的最低平均置信度。
+LOCAL_OCR_REPAIR_MIN_CONFIDENCE = 0.65
+
+# 文本短于等于该长度时，认为有较高概率存在截断。
+LOCAL_OCR_SHORT_TEXT_LENGTH = 2
+
+# 局部裁剪向内缩，避免表格边线进入 OCR。
+LOCAL_OCR_INSET_RATIO_X = 0.035
+LOCAL_OCR_INSET_RATIO_Y = 0.08
+
 # OCR文字与节次中心的最大匹配距离
 PERIOD_MATCH_RATIO = 0.45
 
@@ -3720,194 +3743,227 @@ def extract_edge_name_candidates(text):
 
 def infer_teacher_names(items):
     """
-    从整张课表的有效 OCR 项目中推断教师姓名。
+    根据版面证据推断教师姓名。
 
-    重要：
-    2字中文文本本身存在较大歧义，例如“班队”。
-    因此：
-      - 3字姓名可以直接作为强候选；
-      - 2字姓名若出现在“课程+姓名”末尾，可以作为候选；
-      - 单独出现的2字姓名，必须结合“位于同一课程格、且明显在另一文字下方”
-        或“重复出现”等证据，避免误删课程词。
+    课程默认保留。只有同时获得足够版面/重复证据的短中文文本，
+    才进入教师过滤集合。
     """
 
-    exact_counts = Counter()
-    suffix_counts = Counter()
-    prefix_counts = Counter()
-    edge_positions = {}
+    if not items:
+        return set()
 
-    # 单独出现的 2 字姓名，需要保存位置，后面结合课程格判断。
-    standalone_two_char = []
+    cell_groups = {}
 
     for item in items:
+        for day_index in item.get(
+            "day_indices",
+            []
+        ):
+            key = (
+                item.get(
+                    "period_number"
+                ),
+                day_index
+            )
 
-        text = normalize_text(
-            item.get(
-                "text",
-                ""
+            cell_groups.setdefault(
+                key,
+                []
+            ).append(item)
+
+    evidence = {}
+    occurrences = {}
+
+    def add_evidence(
+        name,
+        score
+    ):
+        name = re.sub(
+            r"\s+",
+            "",
+            str(name)
+        )
+
+        if (
+            len(name) < 2
+            or
+            len(name) > 3
+            or
+            not re.fullmatch(
+                r"[\u4e00-\u9fff]{2,3}",
+                name
+            )
+            or
+            name in COURSE_NAME_EXACT
+        ):
+            return
+
+        evidence[name] = (
+            evidence.get(
+                name,
+                0
+            )
+            + score
+        )
+
+    for key, group in cell_groups.items():
+
+        ordered = sorted(
+            group,
+            key=lambda x: (
+                x["cy"],
+                x["cx"]
             )
         )
+
+        for index, item in enumerate(
+            ordered
+        ):
+
+            compact = re.sub(
+                r"\s+",
+                "",
+                normalize_text(
+                    item.get(
+                        "text",
+                        ""
+                    )
+                )
+            )
+
+            if (
+                len(compact) not in (2, 3)
+                or
+                not re.fullmatch(
+                    r"[\u4e00-\u9fff]{2,3}",
+                    compact
+                )
+                or
+                compact in COURSE_NAME_EXACT
+            ):
+                continue
+
+            # 必须有其它文字位于当前候选上方。
+            above = [
+                other
+                for other in ordered
+                if other is not item
+                and
+                other["cy"]
+                <
+                item["cy"]
+                -
+                max(
+                    6,
+                    (
+                        item["box"][3]
+                        -
+                        item["box"][1]
+                    )
+                    * 0.35
+                )
+            ]
+
+            if not above:
+                continue
+
+            score = 3
+
+            # 常见姓氏只作为弱证据。
+            if compact[0] in COMMON_SURNAMES:
+                score += 1
+
+            # 候选明显位于该格下部，再加一点证据。
+            max_y = max(
+                other["cy"]
+                for other
+                in ordered
+            )
+
+            if item["cy"] >= (
+                min(
+                    other["cy"]
+                    for other
+                    in ordered
+                )
+                +
+                (
+                    max_y
+                    -
+                    min(
+                        other["cy"]
+                        for other
+                        in ordered
+                    )
+                )
+                * 0.55
+            ):
+                score += 1
+
+            add_evidence(
+                compact,
+                score
+            )
+
+            occurrences.setdefault(
+                compact,
+                set()
+            ).add(key)
+
+    # 同一个候选在多个不同课程格重复出现，是强证据。
+    for name, cells in occurrences.items():
+        if len(cells) >= 2:
+            add_evidence(
+                name,
+                min(
+                    3,
+                    len(cells)
+                )
+            )
+
+    # 粘连形式：课程+教师的尾部姓名。
+    for item in items:
 
         compact = re.sub(
             r"\s+",
             "",
-            text
+            normalize_text(
+                item.get(
+                    "text",
+                    ""
+                )
+            )
         )
 
         if not compact:
             continue
 
-        if is_name_like(compact):
-
-            exact_counts[compact] += 1
-
-            if len(compact) == 2:
-                standalone_two_char.append(item)
-
-        candidates = extract_edge_name_candidates(
+        for name, position in extract_edge_name_candidates(
             compact
-        )
+        ):
 
-        names_in_item = set()
-
-        for name, position in candidates:
-
-            names_in_item.add(name)
-
-            edge_positions.setdefault(
-                name,
-                []
-            ).append(position)
+            if name in COURSE_NAME_EXACT:
+                continue
 
             if position == "suffix":
-                suffix_counts[name] += 1
-
-            elif position == "prefix":
-                prefix_counts[name] += 1
-
-        # 一个 OCR 框里同时出现两个姓名，
-        # 例如：姜家欢唱游·乐潘姝玥。
-        if len(names_in_item) >= 2:
-
-            for name in names_in_item:
-
-                edge_positions.setdefault(
+                add_evidence(
                     name,
-                    []
-                ).append(
-                    "multi_name"
+                    2
                 )
 
-    teacher_names = set()
+                if name[0] in COMMON_SURNAMES:
+                    add_evidence(
+                        name,
+                        1
+                    )
 
-    # --------------------------------------------------------
-    # 1. 3字独立姓名：强候选
-    # 2字独立文本不能仅凭“像姓名”直接删除。
-    # --------------------------------------------------------
-    for name in exact_counts:
+    return {
+        name
+        for name, score
+        in evidence.items()
+        if score >= 4
+    }
 
-        if len(name) >= 3:
-            teacher_names.add(name)
-
-    # --------------------------------------------------------
-    # 2. 单独出现的2字姓名：
-    # 如果它在同一个课程格里明显位于另一段文字下方，
-    # 则很像“课程在上、教师在下”的版式。
-    # --------------------------------------------------------
-    for item in standalone_two_char:
-
-        name = re.sub(
-            r"\s+",
-            "",
-            item["text"]
-        )
-
-        same_cell_items = []
-
-        for other in items:
-
-            if other is item:
-                continue
-
-            if (
-                other.get("period_number")
-                !=
-                item.get("period_number")
-            ):
-                continue
-
-            item_days = set(
-                item.get(
-                    "day_indices",
-                    []
-                )
-            )
-
-            other_days = set(
-                other.get(
-                    "day_indices",
-                    []
-                )
-            )
-
-            if not (
-                item_days
-                &
-                other_days
-            ):
-                continue
-
-            same_cell_items.append(
-                other
-            )
-
-        has_upper_text = any(
-            other["cy"]
-            <
-            item["cy"] - 8
-            for other
-            in same_cell_items
-            if other.get("text")
-        )
-
-        if has_upper_text:
-            teacher_names.add(name)
-
-    # --------------------------------------------------------
-    # 3. “课程 + 教师”：
-    # 尾部姓名是目前最可靠的组合形式。
-    # --------------------------------------------------------
-    for name in suffix_counts:
-
-        # 两字姓名也允许，例如：
-        # 英语赵静
-        teacher_names.add(name)
-
-    # --------------------------------------------------------
-    # 4. “教师 + 课程”：
-    # 需要更多证据，避免课程词误判。
-    # --------------------------------------------------------
-    for name, count in prefix_counts.items():
-
-        positions = edge_positions.get(
-            name,
-            []
-        )
-
-        if (
-            len(name) >= 3
-            and
-            (
-                exact_counts.get(name, 0) > 0
-                or
-                count >= 2
-                or
-                "multi_name" in positions
-            )
-        ):
-            teacher_names.add(name)
-
-    return teacher_names
 
 def remove_teacher_names(
     text,
