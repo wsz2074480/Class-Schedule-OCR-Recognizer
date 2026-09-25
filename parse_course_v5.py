@@ -1555,11 +1555,17 @@ def is_obvious_non_course(text):
     if not text:
         return True
 
-    if text in NON_COURSE_EXACT:
+    compact = re.sub(
+        r"\s+",
+        "",
+        text
+    )
+
+    if compact in NON_COURSE_EXACT:
         return True
 
     for keyword in NON_COURSE_KEYWORDS:
-        if keyword in text:
+        if keyword in compact:
             return True
 
     return False
@@ -2196,22 +2202,214 @@ def detect_day_columns(items):
 # 从课程网格本身推断行
 # ============================================================
 
-def infer_periods_from_grid(
+def _detect_schedule_row_bands(
     items,
-    day_columns
+    day_columns,
+    image_path
 ):
     """
-    不依赖左侧“第几节/上午几/下午几”标签，
-    直接根据五个星期列里的 OCR 文字垂直分布推断课程行。
+    从课程表真实的横向网格线识别行边界。
+    文字 OCR 只负责内容，课程“行”由表格几何决定。
+    """
 
-    这是当前课程表解析的主方案。
+    if (
+        cv2 is None
+        or not image_path
+        or not os.path.exists(image_path)
+        or len(day_columns) < 2
+    ):
+        return []
 
-    优点：
-    - 左侧节次标签缺失、被遮挡、写法特殊，都不影响；
-    - “下午1、下午2、课后服务及课外活动一、二”这类混合行
-      仍然可以连续建立为第5~8节；
-    - 行号只用于标准化输出，不把某个学校的原始标签格式
-      当成课程表结构的必要条件。
+    try:
+        image = cv2.imread(
+            image_path,
+            cv2.IMREAD_GRAYSCALE
+        )
+
+        if image is None:
+            return []
+
+        height, width = image.shape
+
+        centers = sorted(
+            day["cx"]
+            for day in day_columns
+        )
+
+        gaps = [
+            centers[i] - centers[i - 1]
+            for i in range(
+                1,
+                len(centers)
+            )
+        ]
+
+        if not gaps:
+            return []
+
+        typical_gap = median(gaps)
+
+        grid_left = max(
+            0,
+            int(
+                centers[0]
+                - typical_gap * 0.75
+            )
+        )
+
+        grid_right = min(
+            width,
+            int(
+                centers[-1]
+                + typical_gap * 0.75
+            )
+        )
+
+        roi = image[
+            :,
+            grid_left:grid_right
+        ]
+
+        binary = cv2.adaptiveThreshold(
+            roi,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            7
+        )
+
+        horizontal_length = max(
+            40,
+            int(
+                roi.shape[1] * 0.025
+            )
+        )
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (
+                horizontal_length,
+                1
+            )
+        )
+
+        horizontal = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_OPEN,
+            kernel
+        )
+
+        coverage = (
+            horizontal.astype(
+                np.float32
+            ).mean(axis=1)
+        )
+
+        candidate_rows = np.where(
+            coverage >= 0.35
+        )[0]
+
+        if len(candidate_rows) == 0:
+            return []
+
+        groups = []
+
+        for y in candidate_rows:
+            if not groups:
+                groups.append([int(y)])
+                continue
+
+            if (
+                y
+                -
+                groups[-1][-1]
+                <= 3
+            ):
+                groups[-1].append(
+                    int(y)
+                )
+            else:
+                groups.append(
+                    [int(y)]
+                )
+
+        lines = [
+            float(
+                median(group)
+            )
+            for group in groups
+        ]
+
+        header_y = median(
+            day["cy"]
+            for day in day_columns
+            if day.get("cy") is not None
+        )
+
+        lines = [
+            line
+            for line in lines
+            if line > header_y + 12
+        ]
+
+        if len(lines) < 2:
+            return []
+
+        line_gaps = [
+            lines[i] - lines[i - 1]
+            for i in range(
+                1,
+                len(lines)
+            )
+            if lines[i] - lines[i - 1] > 10
+        ]
+
+        if not line_gaps:
+            return []
+
+        typical_row_height = median(
+            line_gaps
+        )
+
+        bands = []
+
+        for i in range(
+            len(lines) - 1
+        ):
+            top = lines[i]
+            bottom = lines[i + 1]
+            row_height = bottom - top
+
+            if row_height < 15:
+                continue
+
+            if row_height > (
+                typical_row_height * 2.6
+            ):
+                continue
+
+            bands.append({
+                "top": top,
+                "bottom": bottom,
+                "cy": (
+                    top + bottom
+                ) / 2
+            })
+
+        return bands
+
+    except Exception:
+        return []
+
+
+def infer_periods_from_grid(
+    items,
+    day_columns,
+    image_path=None
+):
+    """
+    首选表格横线确定课程行；没有可靠横线时才退回 OCR Y 聚类。
     """
 
     if not day_columns:
@@ -2225,13 +2423,118 @@ def infer_periods_from_grid(
 
     header_y = median(
         day["cy"]
-        for day
-        in day_columns
+        for day in day_columns
         if day.get("cy") is not None
     )
 
     grid_left = boundaries[0]
     grid_right = boundaries[-1]
+
+    # --------------------------------------------------------
+    # 方案 A：根据真实横向表格线确定行
+    # --------------------------------------------------------
+
+    bands = _detect_schedule_row_bands(
+        items,
+        day_columns,
+        image_path
+    )
+
+    if bands:
+
+        periods = []
+
+        for band in bands:
+
+            band_items = [
+                item
+                for item in items
+                if (
+                    band["top"] - 3
+                    <= item["cy"]
+                    <= band["bottom"] + 3
+                    and
+                    item["cx"]
+                    >= grid_left
+                    and
+                    item["cx"]
+                    < grid_right
+                )
+            ]
+
+            meaningful = [
+                item
+                for item in band_items
+                if not is_obvious_non_course(
+                    item.get(
+                        "text",
+                        ""
+                    )
+                )
+            ]
+
+            # 只包含“晨诵/午休”等活动的横线行直接跳过。
+            if not meaningful:
+                continue
+
+            number = len(periods) + 1
+
+            periods.append({
+                "number":
+                    number,
+
+                "label":
+                    f"第{number}节",
+
+                "raw_label":
+                    None,
+
+                "start":
+                    number,
+
+                "end":
+                    number,
+
+                "cx":
+                    median(
+                        item["cx"]
+                        for item in meaningful
+                    ),
+
+                "cy":
+                    band["cy"],
+
+                "score":
+                    min(
+                        float(
+                            item["score"]
+                        )
+                        for item in meaningful
+                    ),
+
+                "source":
+                    "表格横线行推断",
+
+                "item_count":
+                    len(meaningful),
+
+                "row_top":
+                    band["top"],
+
+                "row_bottom":
+                    band["bottom"],
+
+                "row_height":
+                    band["bottom"]
+                    - band["top"]
+            })
+
+        if len(periods) >= 2:
+            return periods
+
+    # --------------------------------------------------------
+    # 方案 B：没有可靠表格线时，退回 OCR Y 聚类
+    # --------------------------------------------------------
 
     candidates = []
 
@@ -2247,7 +2550,6 @@ def infer_periods_from_grid(
         if not text:
             continue
 
-        # 星期表头及明显的标题区域。
         if item["cy"] <= header_y + 20:
             continue
 
@@ -2262,7 +2564,6 @@ def infer_periods_from_grid(
         ):
             continue
 
-        # 左侧节次标签不参与行推断。
         if item["cx"] < grid_left:
             continue
 
@@ -2274,27 +2575,11 @@ def infer_periods_from_grid(
         ) is not None:
             continue
 
-        # 备注、晨诵、午休等明显不是课程行的内容。
         if is_obvious_non_course(
             text
         ):
             continue
 
-        bbox_width = max(
-            1,
-            item["box"][2]
-            -
-            item["box"][0]
-        )
-
-        # 排除横跨整个课程表的页脚/备注。
-        # 普通单元格文字即使很长，也不会横跨近两列。
-        if bbox_width > (
-            cell_width * 1.8
-        ):
-            continue
-
-        # 确保文字确实落在星期课程网格中。
         if not assign_days(
             item,
             day_columns
@@ -2308,7 +2593,6 @@ def infer_periods_from_grid(
     if not candidates:
         return []
 
-    # 根据 OCR 文字高度动态设置“同一行”的 Y 容差。
     heights = [
         max(
             1,
@@ -2316,19 +2600,14 @@ def infer_periods_from_grid(
             -
             item["box"][1]
         )
-        for item
-        in candidates
+        for item in candidates
     ]
-
-    row_tolerance = median(
-        heights
-    ) * 1.15
 
     row_tolerance = max(
         16,
         min(
             ROW_CLUSTER_MAX_DISTANCE,
-            row_tolerance
+            median(heights) * 1.15
         )
     )
 
@@ -2337,22 +2616,8 @@ def infer_periods_from_grid(
         tolerance=row_tolerance
     )
 
-    periods = []
-
-    for index, group in enumerate(
-        groups,
-        start=1
-    ):
-
-        if not group:
-            continue
-
-        center_y = median(
-            item["cy"]
-            for item in group
-        )
-
-        periods.append({
+    return [
+        {
             "number":
                 index,
 
@@ -2371,31 +2636,43 @@ def infer_periods_from_grid(
             "cx":
                 median(
                     item["cx"]
-                    for item in group
+                    for item
+                    in group
                 ),
 
             "cy":
-                center_y,
+                median(
+                    item["cy"]
+                    for item
+                    in group
+                ),
 
             "score":
                 min(
                     float(
                         item["score"]
                     )
-                    for item in group
+                    for item
+                    in group
                 ),
 
             "source":
-                "课程网格行推断",
+                "课程网格OCR行推断",
 
             "item_count":
                 len(group),
 
             "row_tolerance":
                 row_tolerance
-        })
+        }
+        for index, group
+        in enumerate(
+            groups,
+            start=1
+        )
+    ]
 
-    return periods
+
 
 
 # ============================================================
@@ -2404,7 +2681,8 @@ def infer_periods_from_grid(
 
 def detect_periods(
     items,
-    day_columns
+    day_columns,
+    image_path=None
 ):
     """
     节次检测。
@@ -2422,7 +2700,8 @@ def detect_periods(
 
     periods = infer_periods_from_grid(
         items,
-        day_columns
+        day_columns,
+        image_path
     )
 
     if periods:
@@ -2660,6 +2939,24 @@ def assign_period(
     threshold
 ):
 
+    # 有真实网格行边界时，直接判断文字中心落在哪一行。
+    for period in periods:
+
+        if (
+            "row_top" in period
+            and
+            "row_bottom" in period
+            and
+            period["row_top"] - 3
+            <= item["cy"]
+            <= period["row_bottom"] + 3
+        ):
+            return (
+                period,
+                0.0
+            )
+
+    # 无表格行边界时，使用旧的最近中心兜底。
     nearest = min(
         periods,
         key=lambda p:
@@ -2675,7 +2972,6 @@ def assign_period(
     )
 
     if distance > threshold:
-
         return (
             None,
             distance
@@ -3521,7 +3817,8 @@ def run_ocr(
 # ============================================================
 
 def parse_orientation(
-    items
+    items,
+    image_path=None
 ):
 
     if not items:
@@ -3562,7 +3859,8 @@ def parse_orientation(
 
     periods = detect_periods(
         items,
-        day_columns
+        day_columns,
+        image_path
     )
 
 
@@ -4754,7 +5052,8 @@ def main():
     )
 
     parsed = parse_orientation(
-        items
+        items,
+        preprocessed_path
     )
 
     print()
