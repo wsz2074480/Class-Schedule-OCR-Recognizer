@@ -9,7 +9,7 @@ import unicodedata
 from collections import Counter
 
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font, Alignment, PatternFill
 from statistics import median
 
 import numpy as np
@@ -4892,6 +4892,13 @@ def save_xlsx(
             ]
         )
 
+    # 低置信度提醒：与程序已有 LOW_CONFIDENCE_THRESHOLD 保持一致。
+    # 黄色仅标记“需要人工核查”的课程格，不修改文字内容。
+    low_confidence_fill = PatternFill(
+        fill_type="solid",
+        fgColor="FFF2CC"
+    )
+
     # 表头与单元格采用适合人工校对的基础格式。
     for cell in ws[1]:
         cell.font = Font(bold=True)
@@ -4900,15 +4907,58 @@ def save_xlsx(
             vertical="center"
         )
 
-    for row in ws.iter_rows(
-        min_row=2
+    for row_index, schedule_row in enumerate(
+        schedule,
+        start=2
     ):
-        for cell in row:
-            cell.alignment = Alignment(
+        # 第一列节次
+        ws.cell(
+            row=row_index,
+            column=1
+        ).alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True
+        )
+
+        for day_index, day in enumerate(
+            day_columns,
+            start=2
+        ):
+            excel_cell = ws.cell(
+                row=row_index,
+                column=day_index
+            )
+
+            excel_cell.alignment = Alignment(
                 horizontal="center",
                 vertical="center",
                 wrap_text=True
             )
+
+            course_cell = schedule_row[
+                "cells"
+            ][
+                day["label"]
+            ]
+
+            confidence = course_cell.get(
+                "min_confidence"
+            )
+
+            if (
+                confidence is not None
+                and
+                confidence < LOW_CONFIDENCE_THRESHOLD
+                and
+                course_cell.get(
+                    "text",
+                    ""
+                )
+            ):
+                excel_cell.fill = (
+                    low_confidence_fill
+                )
 
     # 第一列节次稍窄，其余课程列适当加宽。
     ws.column_dimensions["A"].width = 10
