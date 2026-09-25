@@ -2669,13 +2669,13 @@ def infer_periods_from_grid(
     image_path=None
 ):
     """
-    用真实表格横线确定课程行。
+    通过真实表格横线确定课程行，不依赖左侧节次标签。
 
-    不依赖左侧“第几节”：
-    - 正常网格行保留；
-    - 晨诵/午休等活动行跳过；
-    - 活动行中的教师姓名不会让该行重新变成课程行；
-    - 跳过的活动行不会被后续文字吸附到相邻课程行。
+    行分类：
+    - 明确的晨诵/午休/课间活动行：直接过滤；
+    - 前后完全没有课程文字的伪行：过滤；
+    - 中间完全空白的行：保留，供局部 OCR 补识别；
+    - 任意非活动课程名称默认保留，不依赖课程词库。
     """
 
     if not day_columns:
@@ -2704,7 +2704,7 @@ def infer_periods_from_grid(
 
     if bands:
 
-        periods = []
+        records = []
 
         for band in bands:
 
@@ -2730,7 +2730,6 @@ def infer_periods_from_grid(
                 )
             )
 
-            # 同一行的 OCR 文本去掉空格后再组合。
             compact_text = "".join(
                 re.sub(
                     r"\s+",
@@ -2742,7 +2741,8 @@ def infer_periods_from_grid(
                         )
                     )
                 )
-                for item in ordered
+                for item
+                in ordered
             )
 
             activity_hit = (
@@ -2757,62 +2757,93 @@ def infer_periods_from_grid(
                 )
             )
 
-            # 判断该行是否存在真正的课程文本。
-            course_items = []
-
-            for item in band_items:
-
-                text = normalize_text(
-                    item.get(
-                        "text",
-                        ""
+            # 这里不依赖 is_name_like 来判断“是否课程”。
+            # 课程名称可能只有2~4字，也可能恰好以常见姓氏开头。
+            content_items = [
+                item
+                for item
+                in band_items
+                if (
+                    normalize_text(
+                        item.get(
+                            "text",
+                            ""
+                        )
+                    )
+                    and
+                    not (
+                        re.sub(
+                            r"\s+",
+                            "",
+                            normalize_text(
+                                item.get(
+                                    "text",
+                                    ""
+                                )
+                            )
+                        )
+                        in {
+                            "午",
+                            "休",
+                            "晨",
+                            "读"
+                        }
+                    )
+                    and
+                    not is_obvious_non_course(
+                        item.get(
+                            "text",
+                            ""
+                        )
                     )
                 )
+            ]
 
-                compact_item = re.sub(
-                    r"\s+",
-                    "",
-                    text
-                )
+            records.append({
+                "band":
+                    band,
 
-                if not compact_item:
-                    continue
+                "band_items":
+                    band_items,
 
-                if is_obvious_non_course(
-                    compact_item
-                ):
-                    continue
+                "content_items":
+                    content_items,
 
-                if compact_item in {
-                    "午",
-                    "休",
-                    "晨",
-                    "读"
-                }:
-                    continue
+                "activity":
+                    activity_hit
+            })
 
-                # 教师姓名不是课程。
-                if is_name_like(
-                    compact_item
-                ):
-                    continue
+        # 明确活动行直接删除。
+        records = [
+            record
+            for record in records
+            if not record["activity"]
+        ]
 
-                # 单字 OCR 片段默认当作噪声。
-                if len(compact_item) <= 1:
-                    continue
+        # 前后空白伪行删除；中间空白行保留给局部 OCR。
+        meaningful = [
+            index
+            for index, record
+            in enumerate(records)
+            if record["content_items"]
+        ]
 
-                course_items.append(
-                    item
-                )
+        if meaningful:
 
-            # 活动行：
-            # “晨诵 + 教师姓名”以及“午 + 休”都在这里被删除。
-            if (
-                activity_hit
-                and
-                not course_items
-            ):
-                continue
+            records = records[
+                meaningful[0]:
+                meaningful[-1] + 1
+            ]
+        else:
+            records = []
+
+        periods = []
+
+        for record in records:
+
+            band = record["band"]
+            band_items = record["band_items"]
+            content_items = record["content_items"]
 
             number = len(periods) + 1
 
@@ -2837,9 +2868,9 @@ def infer_periods_from_grid(
                         median(
                             item["cx"]
                             for item
-                            in course_items
+                            in content_items
                         )
-                        if course_items
+                        if content_items
                         else
                         median(columns)
                     ),
@@ -2854,9 +2885,9 @@ def infer_periods_from_grid(
                                 item["score"]
                             )
                             for item
-                            in course_items
+                            in content_items
                         )
-                        if course_items
+                        if content_items
                         else
                         1.0
                     ),
@@ -2868,7 +2899,7 @@ def infer_periods_from_grid(
                     len(band_items),
 
                 "course_item_count":
-                    len(course_items),
+                    len(content_items),
 
                 "row_top":
                     band["top"],
@@ -2886,6 +2917,11 @@ def infer_periods_from_grid(
                     band.get(
                         "internal_vertical_count",
                         0
+                    ),
+
+                "empty_before_local_ocr":
+                    not bool(
+                        content_items
                     )
             })
 
@@ -2985,30 +3021,48 @@ def infer_periods_from_grid(
 
     return [
         {
-            "number": index,
-            "label": f"第{index}节",
-            "raw_label": None,
-            "start": index,
-            "end": index,
-            "cx": median(
-                item["cx"]
-                for item
-                in group
-            ),
-            "cy": median(
-                item["cy"]
-                for item
-                in group
-            ),
-            "score": min(
-                float(item["score"])
-                for item
-                in group
-            ),
+            "number":
+                index,
+
+            "label":
+                f"第{index}节",
+
+            "raw_label":
+                None,
+
+            "start":
+                index,
+
+            "end":
+                index,
+
+            "cx":
+                median(
+                    item["cx"]
+                    for item
+                    in group
+                ),
+
+            "cy":
+                median(
+                    item["cy"]
+                    for item
+                    in group
+                ),
+
+            "score":
+                min(
+                    float(item["score"])
+                    for item
+                    in group
+                ),
+
             "source":
                 "课程网格OCR行推断",
+
             "item_count":
                 len(group),
+
             "row_tolerance":
                 row_tolerance
         }
@@ -5044,7 +5098,8 @@ def run_ocr(
 
 def parse_orientation(
     items,
-    image_path=None
+    image_path=None,
+    ocr=None
 ):
 
     if not items:
@@ -5268,6 +5323,33 @@ def parse_orientation(
                 day_indices
         })
 
+
+    # --------------------------------------------------------
+    # 可疑单元格局部补识别
+    # --------------------------------------------------------
+    #
+    # 在教师过滤前执行，让局部 OCR 结果也参与角色判定。
+    #
+
+    local_ocr_start = (
+        time.perf_counter()
+    )
+
+    valid_items, local_ocr_stats = (
+        refine_suspicious_cells(
+            valid_items,
+            periods,
+            day_columns,
+            image_path,
+            ocr
+        )
+    )
+
+    local_ocr_time = (
+        time.perf_counter()
+        -
+        local_ocr_start
+    )
 
     # --------------------------------------------------------
     # 推断教师姓名
@@ -5669,6 +5751,16 @@ def parse_orientation(
 
         "low_confidence":
             low_confidence,
+
+        "local_ocr":
+            {
+                **local_ocr_stats,
+                "time_seconds":
+                    round(
+                        local_ocr_time,
+                        3
+                    )
+            },
 
         "structure_score":
             structure_score
@@ -6351,7 +6443,8 @@ def main():
 
     parsed = parse_orientation(
         items,
-        preprocessed_path
+        preprocessed_path,
+        ocr
     )
 
     print()
