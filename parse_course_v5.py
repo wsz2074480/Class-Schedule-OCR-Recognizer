@@ -4147,6 +4147,808 @@ def join_cell_items(
 # OCR
 # ============================================================
 
+def _get_period_crop_bounds(
+    periods,
+    index,
+    image_height
+):
+    """
+    获取一个标准课程行的垂直范围。
+    """
+
+    period = periods[index]
+
+    if (
+        "row_top" in period
+        and
+        "row_bottom" in period
+    ):
+        return (
+            max(
+                0,
+                float(
+                    period["row_top"]
+                )
+            ),
+            min(
+                float(
+                    period["row_bottom"]
+                ),
+                float(image_height)
+            )
+        )
+
+    center = float(
+        period["cy"]
+    )
+
+    if index > 0:
+        top = (
+            float(
+                periods[index - 1]["cy"]
+            )
+            + center
+        ) / 2
+    else:
+        gap = (
+            float(
+                periods[index + 1]["cy"]
+            )
+            -
+            center
+            if index + 1 < len(periods)
+            else 80
+        )
+        top = center - gap / 2
+
+    if index + 1 < len(periods):
+        bottom = (
+            center
+            +
+            float(
+                periods[index + 1]["cy"]
+            )
+        ) / 2
+    else:
+        gap = (
+            center
+            -
+            float(
+                periods[index - 1]["cy"]
+            )
+            if index > 0
+            else 80
+        )
+        bottom = center + gap / 2
+
+    return (
+        max(
+            0,
+            top
+        ),
+        min(
+            float(image_height),
+            bottom
+        )
+    )
+
+
+def _get_cell_key(
+    item,
+    day_index
+):
+    return (
+        item.get(
+            "period_number"
+        ),
+        day_index
+    )
+
+
+def _cell_raw_text(
+    items
+):
+    """
+    在教师过滤前，只用于判断单元格是否可疑。
+    """
+
+    if not items:
+        return ""
+
+    parts = []
+
+    for item in sorted(
+        items,
+        key=lambda x: (
+            x["cy"],
+            x["cx"]
+        )
+    ):
+        text = re.sub(
+            r"\s+",
+            "",
+            normalize_text(
+                item.get(
+                    "text",
+                    ""
+                )
+            )
+        )
+
+        if not text:
+            continue
+
+        if is_obvious_non_course(
+            text
+        ):
+            continue
+
+        if text in {
+            "午",
+            "休",
+            "晨",
+            "读"
+        }:
+            continue
+
+        parts.append(text)
+
+    return "".join(parts)
+
+
+def _should_refine_cell(
+    text,
+    confidence,
+    row_filled
+):
+    """
+    只把真正可疑的单元格送入局部 OCR。
+    """
+
+    if not text:
+        return (
+            row_filled
+            >=
+            LOCAL_OCR_EMPTY_ROW_MIN_FILLED
+        )
+
+    if len(text) <= LOCAL_OCR_SHORT_TEXT_LENGTH:
+        return True
+
+    if confidence < LOW_CONFIDENCE_THRESHOLD:
+        return True
+
+    return False
+
+
+def refine_suspicious_cells(
+    valid_items,
+    periods,
+    day_columns,
+    image_path,
+    ocr
+):
+    """
+    对可疑课程格进行局部补识别。
+
+    关键设计：
+    - 仍然只初始化一次 PaddleOCR；
+    - 只对少量高优先级单元格调用 predict；
+    - 局部裁剪向内缩，主动避开网格线；
+    - 局部结果如果更完整，则替换该单元格原始 OCR 项，
+      不与旧文字重复拼接。
+    """
+
+    empty_stats = {
+        "candidates": 0,
+        "attempted": 0,
+        "accepted": 0,
+        "time_seconds": 0.0
+    }
+
+    if (
+        ocr is None
+        or
+        not image_path
+        or
+        not os.path.exists(image_path)
+        or
+        not periods
+        or
+        not day_columns
+    ):
+        return (
+            valid_items,
+            empty_stats
+        )
+
+    try:
+        image = Image.open(
+            image_path
+        ).convert("RGB")
+    except Exception:
+        return (
+            valid_items,
+            empty_stats
+        )
+
+    _, boundaries, _ = calculate_day_boundaries(
+        day_columns
+    )
+
+    cell_groups = {}
+
+    for item in valid_items:
+        for day_index in item.get(
+            "day_indices",
+            []
+        ):
+            cell_groups.setdefault(
+                (
+                    item["period_number"],
+                    day_index
+                ),
+                []
+            ).append(item)
+
+    candidates = []
+
+    for period in periods:
+
+        row_filled = 0
+
+        for day_index in range(
+            len(day_columns)
+        ):
+            key = (
+                period["number"],
+                day_index
+            )
+
+            if _cell_raw_text(
+                cell_groups.get(
+                    key,
+                    []
+                )
+            ):
+                row_filled += 1
+
+        for day_index in range(
+            len(day_columns)
+        ):
+
+            key = (
+                period["number"],
+                day_index
+            )
+
+            items = cell_groups.get(
+                key,
+                []
+            )
+
+            text = _cell_raw_text(
+                items
+            )
+
+            scores = [
+                float(
+                    item.get(
+                        "score",
+                        0
+                    )
+                )
+                for item
+                in items
+                if item.get(
+                    "text"
+                )
+                and
+                not is_obvious_non_course(
+                    item.get(
+                        "text",
+                        ""
+                    )
+                )
+            ]
+
+            confidence = (
+                min(scores)
+                if scores
+                else 0.0
+            )
+
+            if not _should_refine_cell(
+                text,
+                confidence,
+                row_filled
+            ):
+                continue
+
+            priority = 0
+
+            if not text:
+                priority += 5
+                if row_filled >= 3:
+                    priority += 2
+
+            elif len(text) <= 2:
+                priority += 4
+
+            if confidence < LOW_CONFIDENCE_THRESHOLD:
+                priority += 2
+
+            if text in {
+                "语",
+                "读",
+                "品",
+                "体",
+                "学",
+                "市"
+            }:
+                priority += 3
+
+            candidates.append({
+                "period":
+                    period["number"],
+                "period_index":
+                    periods.index(
+                        period
+                    ),
+                "day_index":
+                    day_index,
+                "current_text":
+                    text,
+                "current_score":
+                    confidence,
+                "priority":
+                    priority
+            })
+
+    candidates.sort(
+        key=lambda item: (
+            -item["priority"],
+            item["current_score"],
+            item["period"],
+            item["day_index"]
+        )
+    )
+
+    selected = candidates[
+        :LOCAL_OCR_MAX_CELLS
+    ]
+
+    if not selected:
+        return (
+            valid_items,
+            empty_stats
+        )
+
+    os.makedirs(
+        os.path.join(
+            DEBUG_OUTPUT_DIR,
+            "local_ocr"
+        ),
+        exist_ok=True
+    )
+
+    refined_items = list(
+        valid_items
+    )
+
+    accepted = 0
+    started = time.perf_counter()
+
+    for attempt_index, candidate in enumerate(
+        selected,
+        start=1
+    ):
+
+        period_index = candidate[
+            "period_index"
+        ]
+
+        day_index = candidate[
+            "day_index"
+        ]
+
+        row_top, row_bottom = (
+            _get_period_crop_bounds(
+                periods,
+                period_index,
+                image.height
+            )
+        )
+
+        left = boundaries[
+            day_index
+        ]
+
+        right = boundaries[
+            day_index + 1
+        ]
+
+        cell_width = (
+            right - left
+        )
+
+        cell_height = (
+            row_bottom - row_top
+        )
+
+        inset_x = max(
+            6,
+            int(
+                cell_width
+                * LOCAL_OCR_INSET_RATIO_X
+            )
+        )
+
+        inset_y = max(
+            6,
+            int(
+                cell_height
+                * LOCAL_OCR_INSET_RATIO_Y
+            )
+        )
+
+        crop_left = int(
+            max(
+                0,
+                left + inset_x
+            )
+        )
+
+        crop_top = int(
+            max(
+                0,
+                row_top + inset_y
+            )
+        )
+
+        crop_right = int(
+            min(
+                image.width,
+                right - inset_x
+            )
+        )
+
+        crop_bottom = int(
+            min(
+                image.height,
+                row_bottom - inset_y
+            )
+        )
+
+        if (
+            crop_right <= crop_left + 12
+            or
+            crop_bottom <= crop_top + 12
+        ):
+            continue
+
+        crop = image.crop(
+            (
+                crop_left,
+                crop_top,
+                crop_right,
+                crop_bottom
+            )
+        )
+
+        crop_width, crop_height = crop.size
+
+        scale = (
+            520
+            /
+            min(
+                crop_width,
+                crop_height
+            )
+        )
+
+        scale = max(
+            1.0,
+            min(
+                2.5,
+                scale
+            )
+        )
+
+        if scale > 1.01:
+            crop = crop.resize(
+                (
+                    int(
+                        crop_width
+                        * scale
+                    ),
+                    int(
+                        crop_height
+                        * scale
+                    )
+                ),
+                Image.Resampling.BICUBIC
+            )
+
+        crop, _ = _enhance_for_ocr(
+            crop
+        )
+
+        crop_path = os.path.join(
+            DEBUG_OUTPUT_DIR,
+            "local_ocr",
+            (
+                f"cell_{attempt_index:02d}_"
+                f"r{candidate['period']:02d}_"
+                f"d{day_index + 1}.png"
+            )
+        )
+
+        try:
+            crop.save(
+                crop_path
+            )
+
+            local_items, _ = run_ocr(
+                ocr,
+                crop_path
+            )
+        except Exception:
+            continue
+
+        mapped_items = []
+
+        for local_item in local_items:
+
+            text = normalize_text(
+                local_item.get(
+                    "text",
+                    ""
+                )
+            )
+
+            compact = re.sub(
+                r"\s+",
+                "",
+                text
+            )
+
+            if not compact:
+                continue
+
+            if is_obvious_non_course(
+                compact
+            ):
+                continue
+
+            if compact in {
+                "午",
+                "休",
+                "晨",
+                "读"
+            }:
+                continue
+
+            local_box = local_item[
+                "box"
+            ]
+
+            box = [
+                local_box[0] / scale + crop_left,
+                local_box[1] / scale + crop_top,
+                local_box[2] / scale + crop_left,
+                local_box[3] / scale + crop_top
+            ]
+
+            mapped_items.append({
+                **local_item,
+
+                "box":
+                    box,
+
+                "cx":
+                    (
+                        box[0]
+                        +
+                        box[2]
+                    ) / 2,
+
+                "cy":
+                    (
+                        box[1]
+                        +
+                        box[3]
+                    ) / 2,
+
+                "period_number":
+                    candidate["period"],
+
+                "period_label":
+                    periods[
+                        period_index
+                    ]["label"],
+
+                "period_y":
+                    periods[
+                        period_index
+                    ]["cy"],
+
+                "period_distance":
+                    0.0,
+
+                "day_indices":
+                    [day_index],
+
+                "local_ocr":
+                    True,
+
+                "local_crop_path":
+                    crop_path
+            })
+
+        local_text = _cell_raw_text(
+            mapped_items
+        )
+
+        local_scores = [
+            float(
+                item.get(
+                    "score",
+                    0
+                )
+            )
+            for item
+            in mapped_items
+        ]
+
+        local_score = (
+            sum(local_scores)
+            /
+            len(local_scores)
+            if local_scores
+            else 0.0
+        )
+
+        current_text = candidate[
+            "current_text"
+        ]
+
+        current_score = candidate[
+            "current_score"
+        ]
+
+        current_len = len(
+            current_text
+        )
+
+        local_len = len(
+            local_text
+        )
+
+        # 严格接受规则：
+        # 1. 空格子：必须得到 >=2 字且置信度 >= 0.70；
+        # 2. 短文本：新结果必须更长；
+        # 3. 一般低置信度：新结果不得明显更短，且置信度不明显下降。
+        accept = False
+
+        if not local_text:
+            continue
+
+        if not current_text:
+            accept = (
+                local_len >= 2
+                and
+                local_score
+                >= LOCAL_OCR_EMPTY_MIN_CONFIDENCE
+            )
+
+        elif current_len <= LOCAL_OCR_SHORT_TEXT_LENGTH:
+            accept = (
+                local_len > current_len
+                and
+                local_score
+                >= LOCAL_OCR_REPAIR_MIN_CONFIDENCE
+            )
+
+        else:
+            current_canonical = (
+                canonicalize_course_text(
+                    current_text
+                )
+            )
+
+            local_canonical = (
+                canonicalize_course_text(
+                    local_text
+                )
+            )
+
+            accept = (
+                local_len >= current_len
+                and
+                local_score
+                >= current_score - 0.05
+                and
+                (
+                    local_text
+                    !=
+                    current_text
+                    or
+                    local_canonical
+                    !=
+                    current_canonical
+                )
+            )
+
+        if not accept:
+            continue
+
+        target_period = candidate[
+            "period"
+        ]
+
+        target_day = day_index
+
+        new_items = []
+
+        for item in refined_items:
+
+            if (
+                item.get(
+                    "period_number"
+                )
+                ==
+                target_period
+                and
+                len(
+                    item.get(
+                        "day_indices",
+                        []
+                    )
+                )
+                == 1
+                and
+                item["day_indices"][0]
+                ==
+                target_day
+            ):
+                continue
+
+            new_items.append(
+                item
+            )
+
+        refined_items = (
+            new_items
+            +
+            mapped_items
+        )
+
+        accepted += 1
+
+    elapsed = (
+        time.perf_counter()
+        - started
+    )
+
+    return (
+        refined_items,
+        {
+            "candidates":
+                len(candidates),
+            "attempted":
+                len(selected),
+            "accepted":
+                accepted,
+            "time_seconds":
+                round(
+                    elapsed,
+                    3
+                )
+        }
+    )
+
+
 def run_ocr(
     ocr,
     image_path
