@@ -142,6 +142,15 @@ NON_COURSE_EXACT = {
     "早读",
     "晨读",
     "晨诵",
+    "晨练",
+}
+
+# OCR 可能把活动名称拆成多个短框。
+NON_COURSE_FRAGMENT_COMBINATIONS = {
+    "午休",
+    "午睡",
+    "晨读",
+    "晨诵",
 }
 
 
@@ -2207,6 +2216,7 @@ COURSE_CANONICAL_ALIASES = {
     "体有与健康": "体育与健康",
     "体育与健一": "体育与健康",
     "体育与健二": "体育与健康",
+    "体有": "体育",
     "道与法": "道德与法治",
     "道法": "道德与法治",
     "综合实践": "综合实践活动",
@@ -2628,14 +2638,13 @@ def infer_periods_from_grid(
     image_path=None
 ):
     """
-    首选真实表格行边界。
+    用真实表格横线确定课程行。
 
-    过滤规则：
-    1. 标准课程行：保留，即使当前 OCR 没识别出文字；
-    2. 合并行：
-       - 午休/晨诵等非课程活动 → 删除；
-       - 后续如果出现合并型课程安排，则保留；
-    3. 完全依赖课程网格，不依赖左侧第几节标签。
+    不依赖左侧“第几节”：
+    - 正常网格行保留；
+    - 晨诵/午休等活动行跳过；
+    - 活动行中的教师姓名不会让该行重新变成课程行；
+    - 跳过的活动行不会被后续文字吸附到相邻课程行。
     """
 
     if not day_columns:
@@ -2682,7 +2691,15 @@ def infer_periods_from_grid(
                 )
             ]
 
-            # 合并 OCR 小片段，例如“午”“休”，组合后再判断活动名称。
+            ordered = sorted(
+                band_items,
+                key=lambda x: (
+                    x["cy"],
+                    x["cx"]
+                )
+            )
+
+            # 同一行的 OCR 文本去掉空格后再组合。
             compact_text = "".join(
                 re.sub(
                     r"\s+",
@@ -2694,69 +2711,81 @@ def infer_periods_from_grid(
                         )
                     )
                 )
-                for item
-                in sorted(
-                    band_items,
-                    key=lambda x: (
-                        x["cy"],
-                        x["cx"]
-                    )
-                )
+                for item in ordered
             )
 
-            explicit_activity = (
+            activity_hit = (
                 is_obvious_non_course(
                     compact_text
                 )
+                or
+                any(
+                    fragment in compact_text
+                    for fragment
+                    in NON_COURSE_FRAGMENT_COMBINATIONS
+                )
             )
 
-            non_name_items = [
-                item
-                for item in band_items
-                if (
+            # 判断该行是否存在真正的课程文本。
+            course_items = []
+
+            for item in band_items:
+
+                text = normalize_text(
                     item.get(
                         "text",
                         ""
                     )
-                    and
-                    not is_obvious_non_course(
-                        item.get(
-                            "text",
-                            ""
-                        )
-                    )
-                    and
-                    not is_name_like(
-                        item.get(
-                            "text",
-                            ""
-                        )
-                    )
                 )
-            ]
 
-            # 标准行中如果出现活动词，但没有真正课程文字，
-            # 例如“晨诵”，整行直接排除。
-            if (
-                explicit_activity
-                and
-                not non_name_items
-            ):
-                continue
+                compact_item = re.sub(
+                    r"\s+",
+                    "",
+                    text
+                )
 
-            # 合并行若仅是“午休”等活动，排除。
+                if not compact_item:
+                    continue
+
+                if is_obvious_non_course(
+                    compact_item
+                ):
+                    continue
+
+                if compact_item in {
+                    "午",
+                    "休",
+                    "晨",
+                    "读"
+                }:
+                    continue
+
+                # 教师姓名不是课程。
+                if is_name_like(
+                    compact_item
+                ):
+                    continue
+
+                # 单字 OCR 片段默认当作噪声。
+                if len(compact_item) <= 1:
+                    continue
+
+                course_items.append(
+                    item
+                )
+
+            # 活动行：
+            # “晨诵 + 教师姓名”以及“午 + 休”都在这里被删除。
             if (
-                band["merged"]
+                activity_hit
                 and
-                explicit_activity
-                and
-                not non_name_items
+                not course_items
             ):
                 continue
 
             number = len(periods) + 1
 
-            period = {
+            periods.append({
                 "number":
                     number,
 
@@ -2773,13 +2802,16 @@ def infer_periods_from_grid(
                     number,
 
                 "cx":
-                    median(
-                        item["cx"]
-                        for item
-                        in band_items
-                    )
-                    if band_items
-                    else median(columns),
+                    (
+                        median(
+                            item["cx"]
+                            for item
+                            in course_items
+                        )
+                        if course_items
+                        else
+                        median(columns)
+                    ),
 
                 "cy":
                     band["cy"],
@@ -2791,10 +2823,11 @@ def infer_periods_from_grid(
                                 item["score"]
                             )
                             for item
-                            in band_items
+                            in course_items
                         )
-                        if band_items
-                        else 1.0
+                        if course_items
+                        else
+                        1.0
                     ),
 
                 "source":
@@ -2803,6 +2836,9 @@ def infer_periods_from_grid(
                 "item_count":
                     len(band_items),
 
+                "course_item_count":
+                    len(course_items),
+
                 "row_top":
                     band["top"],
 
@@ -2810,18 +2846,22 @@ def infer_periods_from_grid(
                     band["bottom"],
 
                 "merged":
-                    band["merged"],
+                    band.get(
+                        "merged",
+                        False
+                    ),
 
                 "internal_vertical_count":
-                    band["internal_vertical_count"]
-            }
-
-            periods.append(period)
+                    band.get(
+                        "internal_vertical_count",
+                        0
+                    )
+            })
 
         if len(periods) >= 2:
             return periods
 
-    # 没有可靠表格线时继续使用旧方案。
+    # 无可靠表格线时的备用方案。
     candidates = []
 
     for item in items:
@@ -2833,7 +2873,13 @@ def infer_periods_from_grid(
             )
         )
 
-        if not text:
+        compact_text = re.sub(
+            r"\s+",
+            "",
+            text
+        )
+
+        if not compact_text:
             continue
 
         if item["cy"] <= header_y + 20:
@@ -2862,8 +2908,16 @@ def infer_periods_from_grid(
             continue
 
         if is_obvious_non_course(
-            text
+            compact_text
         ):
+            continue
+
+        if compact_text in {
+            "午",
+            "休",
+            "晨",
+            "读"
+        }:
             continue
 
         if not assign_days(
@@ -3198,8 +3252,6 @@ def assign_period(
     threshold
 ):
 
-    # 有真实表格行边界时，只允许文字进入其所在的真实课程行。
-    # 不再使用“最近行”把午休/备注等文字吸附到附近课程行。
     row_bounded = any(
         "row_top" in period
         and
@@ -3230,7 +3282,6 @@ def assign_period(
             float("inf")
         )
 
-    # 无真实行边界时，使用旧的最近中心兜底。
     nearest = min(
         periods,
         key=lambda p:
@@ -3936,6 +3987,26 @@ def join_cell_items(
         if not text:
             continue
 
+        # 独立的单字通常是 OCR 噪声/活动残片。
+        compact_item = re.sub(
+            r"\s+",
+            "",
+            text
+        )
+
+        if (
+            len(compact_item) <= 1
+            and
+            compact_item in {
+                "午",
+                "休",
+                "晨",
+                "读",
+                "语"
+            }
+        ):
+            continue
+
         # OCR 单独识别出一整行教师姓名。
         if (
             text in teacher_names
@@ -4228,6 +4299,28 @@ def parse_orientation(
 
             continue
 
+
+
+        compact_text = re.sub(
+            r"\s+",
+            "",
+            text
+        )
+
+        if compact_text in {
+            "午",
+            "休",
+            "晨",
+            "读"
+        }:
+            ignored.append({
+                "text":
+                    text,
+                "reason":
+                    "活动名称残片"
+            })
+
+            continue
 
         # Y匹配节次
         period, distance = (
